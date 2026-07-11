@@ -21,8 +21,32 @@ behavior — so we raise their log levels to hide the noise without
 hiding real errors from other loggers.
 """
 import logging
+import os
 
 
 def configure_logging() -> None:
+    """Configures logging to both console and a file in .data/agent.log."""
+    log_dir = ".data"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "agent.log")
+
+    log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(log_format)
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(log_format)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+
+    root_logger.addHandler(console_handler)
+    root_logger.addHandler(file_handler)
+
     logging.getLogger("langchain_google_genai").setLevel(logging.ERROR)
     logging.getLogger("google_genai").setLevel(logging.ERROR)
+    logging.getLogger("langchain_google_genai._function_utils").setLevel(logging.ERROR)

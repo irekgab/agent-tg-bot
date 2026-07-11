@@ -1,4 +1,4 @@
-"""Entry point: run the agent on a single prompt or interactively.
+"""Run the agent in CLI in a single prompt or interactively.
 
 Usage:
     python main.py "your_prompt"        # single prompt
@@ -18,11 +18,11 @@ def run(prompt: str) -> str:
 
 
 def main() -> None:
+    configure_logging()
     if len(sys.argv) > 1:
         print(run(" ".join(sys.argv[1:])))
         return
 
-    configure_logging()
     app = build_graph()
     print("Agent ready. Type 'exit' to quit.")
     
