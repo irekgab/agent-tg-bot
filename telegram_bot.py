@@ -3,16 +3,17 @@ from logging_config import configure_logging
 
 import asyncio
 import sqlite3
+import time
 from telegram import Update, constants
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 
 from config import TELEGRAM_BOT_TOKEN
-from graph import build_graph
+from graph import build_graph_async
 from streaming import extract_text
 
 logger = logging.getLogger(__name__)
 
-app = build_graph()
+app = None
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the user types /start."""
@@ -29,14 +30,16 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = str(update.effective_user.id)
     
     try:
-        conn = sqlite3.connect(".data/history.db")
-        cursor = conn.cursor()
+        # Run synchronous sqlite3 in a thread to avoid blocking the event loop
+        def clear_db():
+            conn = sqlite3.connect(".data/history.db")
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM checkpoints WHERE thread_id = ?", (user_id,))
+            cursor.execute("DELETE FROM writes WHERE thread_id = ?", (user_id,))
+            conn.commit()
+            conn.close()
         
-        cursor.execute("DELETE FROM checkpoints WHERE thread_id = ?", (user_id,))
-        cursor.execute("DELETE FROM writes WHERE thread_id = ?", (user_id,))
-        
-        conn.commit()
-        conn.close()
+        await asyncio.to_thread(clear_db)
         
         await update.message.reply_text("Your conversation history has been cleared! You can start a new chat now.")
     except Exception as e:
@@ -44,7 +47,12 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Failed to clear conversation history. Please try again later.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming text messages from Telegram users."""
+    """Handles incoming text messages from Telegram users with streaming responses."""
+    global app
+    if app is None:
+        logger.error("Agent graph is not initialized.")
+        return
+
     user_id = update.effective_user.id
     user_text = update.message.text
 
@@ -53,36 +61,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     config = {"configurable": {"thread_id": str(user_id)}}
 
-    # Send "typing..." action to improve UX
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
 
+    # Initial placeholder message
+    sent_message = await update.message.reply_text("Thinking...")
+
     try:
-        def run_agent():
-            full_response = ""
-            for chunk, metadata in app.stream(
-                {"messages": [{"role": "user", "content": user_text}]},
-                config=config,
-                stream_mode="messages",
-            ):
-                # We only care about the agent's response chunks
-                if metadata.get("langgraph_node") == "agent":
-                    text = extract_text(chunk.content)
-                    if text:
-                        full_response += text
-            return full_response
+        full_response = ""
+        last_update_time = time.time()
+        update_interval = 0.2 # to avoid rate limits
 
-        response_text = await asyncio.to_thread(run_agent)
+        async for chunk, metadata in app.astream(
+            {"messages": [{"role": "user", "content": user_text}]},
+            config=config,
+            stream_mode="messages",
+        ):
+            if metadata.get("langgraph_node") == "agent":
+                text = extract_text(chunk.content)
+                if text:
+                    full_response += text
+                    
+                    current_time = time.time()
+                    if current_time - last_update_time > update_interval:
+                        try:
+                            await sent_message.edit_text(full_response + " ▌")
+                            last_update_time = current_time
+                        except Exception:
+                            pass
 
-        if response_text:
-            await update.message.reply_text(response_text)
+        if full_response:
+            await sent_message.edit_text(full_response)
         else:
-            await update.message.reply_text("I'm sorry, I couldn't generate a response.")
+            await sent_message.edit_text("I'm sorry, I couldn't generate a response.")
 
     except Exception as e:
         logger.error(f"Error processing message from user {user_id}: {e}")
-        await update.message.reply_text("An error occurred while processing your request. Please try again later.")
+        try:
+            await sent_message.edit_text("An error occurred while processing your request. Please try again later.")
+        except Exception:
+            await update.message.reply_text("An error occurred while processing your request. Please try again later.")
 
-def main() -> None:
+async def main() -> None:
     """Starts the Telegram bot."""
     configure_logging()
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -94,10 +113,32 @@ def main() -> None:
     application.add_handler(message_handler)
 
     logger.info("Telegram bot is starting...")
-    application.run_polling()
+
+    async for app_instance in build_graph_async():
+        global app
+        app = app_instance
+        
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        
+        logger.info("Bot is polling and ready for messages.")
+        
+        stop_event = asyncio.Event()
+        try:
+            # Wait indefinitely until the process is interrupted
+            await stop_event.wait()
+        except asyncio.CancelledError:
+            # This is expected when the task is cancelled (e.g. on Ctrl+C)
+            pass
+        finally:
+            logger.info("Shutting down bot...")
+            await application.stop()
+            await application.shutdown()
+            # The loop will exit, closing the AsyncSqliteSaver context manager
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Telegram bot stopped.")
