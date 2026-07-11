@@ -18,11 +18,13 @@ app = None
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the user types /start."""
     await update.message.reply_text(
-        "Hello! I am your AI Agent. You can chat with me, ask me to read files, "
+        "*Hello! I am your AI Agent.*\n\n"
+        "You can chat with me, ask me to read files, "
         "execute commands, or even make web requests!\n\n"
-        "Commands:\n"
+        "*Commands:*\n"
         "/start - Show this message\n"
-        "/clear - Reset your conversation history"
+        "/clear - Reset your conversation history",
+        parse_mode=constants.ParseMode.MARKDOWN
     )
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -41,13 +43,16 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         
         await asyncio.to_thread(clear_db)
         
-        await update.message.reply_text("Your conversation history has been cleared! You can start a new chat now.")
+        await update.message.reply_text(
+            "*Your conversation history has been cleared!* You can start a new chat now.",
+            parse_mode=constants.ParseMode.MARKDOWN
+        )
     except Exception as e:
         logger.error(f"Error clearing history for user {user_id}: {e}")
         await update.message.reply_text("Failed to clear conversation history. Please try again later.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming text messages from Telegram users with streaming responses."""
+    """Handles incoming text messages from Telegram users with streaming responses and Markdown support."""
     global app
     if app is None:
         logger.error("Agent graph is not initialized.")
@@ -63,8 +68,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
 
-    # Initial placeholder message
-    sent_message = await update.message.reply_text("Thinking...")
+    sent_message = await update.message.reply_text("Thinking...", parse_mode=constants.ParseMode.MARKDOWN)
 
     try:
         full_response = ""
@@ -84,13 +88,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     current_time = time.time()
                     if current_time - last_update_time > update_interval:
                         try:
-                            await sent_message.edit_text(full_response + " ▌")
+                            await sent_message.edit_text(full_response + " ▌", parse_mode=constants.ParseMode.MARKDOWN)
                             last_update_time = current_time
                         except Exception:
                             pass
 
         if full_response:
-            await sent_message.edit_text(full_response)
+            try:
+                await sent_message.edit_text(full_response, parse_mode=constants.ParseMode.MARKDOWN)
+            except Exception as e:
+                logger.warning(f"Markdown parsing failed for final message: {e}. Falling back to plain text.")
+                await sent_message.edit_text(full_response)
         else:
             await sent_message.edit_text("I'm sorry, I couldn't generate a response.")
 
