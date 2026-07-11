@@ -24,5 +24,5 @@ import logging
 
 
 def configure_logging() -> None:
-    logging.getLogger("langchain_google_genai._function_utils").setLevel(logging.ERROR)
+    logging.getLogger("langchain_google_genai").setLevel(logging.ERROR)
     logging.getLogger("google_genai").setLevel(logging.ERROR)

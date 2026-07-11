@@ -12,6 +12,10 @@ The agent can interact with the external world using:
 - **Custom Local Tools**: Strict file-system operations sandboxed to the project directory.
 - **Built-in Global Tools**: Gemini's server-side Google Search execution.
 
+The agent can be interacted with via:
+- **CLI**: Interactive or single-prompt modes.
+- **Telegram Bot**: A real-time messaging interface.
+
 ---
 
 ## 2. Directory Structure & Components
@@ -26,6 +30,7 @@ agent-tg-bot/
 ├── logging_config.py  # Logger filtering to suppress noisy warnings
 ├── requirements.txt   # Python dependency list
 ├── streaming.py       # Custom token stream extractor (handling thinking/reasoning blocks)
+├── telegram_bot.py    # Telegram bot implementation
 └── tools.py           # Custom Python tool definitions (sandboxed file utilities)
 ```
 
@@ -85,6 +90,7 @@ The agent operates in a classic cycle of execution managed by a `StateGraph`:
 - Handles dot-env resolution using `python-dotenv`.
 - Loads `LLM_API_KEY` (raises `EnvironmentError` if missing).
 - Loads `MODEL_NAME` (defaults to `"gemma-4-31b-it"`).
+- Loads `TELEGRAM_BOT_TOKEN` (required for Telegram bot mode).
 
 ### `llm.py`
 - Acts as a factory for `ChatGoogleGenerativeAI`.
@@ -109,6 +115,11 @@ The agent operates in a classic cycle of execution managed by a `StateGraph`:
 - Suppresses two redundant warning loggers:
   1. `langchain_google_genai._function_utils`: Silences warnings about stripped JSON schema keys (such as `title`, `$defs`) that the Gemini schema API doesn't support but are natively emitted by Pydantic.
   2. `google_genai`: Silences the message warning that automatic function-calling (AFC) is disabled due to the presence of non-callable dictionary definitions (the `google_search` configuration map) alongside Python tool functions.
+
+### `telegram_bot.py`
+- Implements a Telegram bot interface using `python-telegram-bot`.
+- Uses the Telegram `user_id` as the LangGraph `thread_id` to provide per-user conversation memory.
+- Integrates with the existing agent graph and toolset.
 
 ### `tools.py`
 - Defines Python function-based tools using `@tool` from `langchain_core.tools`.
@@ -143,18 +154,17 @@ The agent operates in a classic cycle of execution managed by a `StateGraph`:
    LLM_API_KEY=your_google_gemma_api_key
    MODEL_NAME=gemma-4-31b-it
    AGENT_WORKSPACE=.
+   TELEGRAM_BOT_TOKEN=your_telegram_bot_token
    ```
 
 ### Running the Agent
-- **Interactive Mode**:
-  ```bash
-  python cli.py
-  ```
-  Type your prompt and press Enter. To exit, type `exit` or `quit`.
+- **CLI Mode**:
+  - **Interactive**: `python cli.py`
+  - **Single Prompt**: `python cli.py "your query"`
 
-- **Single Prompt Mode**:
+- **Telegram Bot Mode**:
   ```bash
-  python cli.py "List the files in the current directory and find if there is any python script."
+  python telegram_bot.py
   ```
 
 ---
