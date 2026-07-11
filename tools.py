@@ -99,4 +99,33 @@ def execute_command(command: str) -> str:
         return f"Error executing command: {exc}"
 
 
-TOOLS = [get_current_time, read_file, write_file, list_directory, execute_command]
+@tool
+def make_web_request(url: str, method: str = "GET", headers: dict = None, data: str = None, params: dict = None) -> str:
+    """Make an HTTP request to a specified URL (domain or IP address).
+
+    Args:
+        url: The full URL to request (e.g., 'http://example.com' or 'https://api.example.com/data').
+        method: The HTTP method to use (e.g., 'GET', 'POST', 'PUT', 'DELETE'). Defaults to 'GET'.
+        headers: A dictionary of HTTP headers to send.
+        data: The body of the request for POST/PUT requests.
+        params: A dictionary of query parameters to append to the URL.
+
+    Returns:
+        The response text or an error message.
+    """
+    import requests
+    try:
+        response = requests.request(
+            method=method.upper(),
+            url=url,
+            headers=headers,
+            data=data,
+            params=params,
+            timeout=15
+        )
+        return f"Status Code: {response.status_code}\n\nResponse:\n{response.text}"
+    except Exception as exc:
+        return f"Error making web request: {exc}"
+
+
+TOOLS = [get_current_time, read_file, write_file, list_directory, execute_command, make_web_request]

@@ -29,14 +29,6 @@ agent-tg-bot/
 └── tools.py           # Custom Python tool definitions (sandboxed file utilities)
 ```
 
-### Key Differences from Old Version
-An older version of this system existed in the `old/` directory. The current system introduces critical architectural upgrades:
-1. **CLI Modernization**: The entry point has been migrated from `main.py` to `cli.py`, with enhanced CLI loop behaviors.
-2. **State Machine Definition**: The graph configuration was moved from `agent.py` to `graph.py` to better align with LangGraph idiomatic layout.
-3. **Workspace Sandboxing**: The tools are now rigorously sandboxed under `tools.py` via safe path resolution (`_resolve_safe_path`), preventing directory traversal attacks.
-4. **Reasoning Stream Filtering**: Gemma-4 models can output thinking/reasoning blocks before generating a response. `streaming.py` filters these out so only user-facing answers stream to stdout.
-5. **Noisy Logger Suppression**: A dedicated `logging_config.py` suppresses harmless warnings from `langchain_google_genai` and `google_genai` triggered by combining custom tools and the built-in `google_search` tool.
-
 ---
 
 ## 3. LangGraph Flow (The ReAct Loop)
@@ -129,6 +121,7 @@ The agent operates in a classic cycle of execution managed by a `StateGraph`:
   - `write_file(path, content)`: Safely writes content to a file within the project (creating parent directories automatically).
   - `list_directory(path=".")`: Safely lists files and subdirectories inside the project directory.
   - `execute_command(command)`: Safely executes a terminal/shell command within the project directory and returns its output (stdout and stderr).
+  - `make_web_request(url, method, headers, data, params)`: Makes an HTTP request to a specified URL.
 
 ---
 
