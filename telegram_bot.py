@@ -118,6 +118,23 @@ async def safe_send(bot, chat_id, raw_text: str, message_thread_id=None, with_cu
     return await bot.send_message(chat_id=chat_id, text=raw_text, message_thread_id=message_thread_id)
 
 
+async def safe_chat_action(bot, chat_id, action, message_thread_id=None):
+    """Perform a chat action, handling rate limits and timeouts."""
+    for _ in range(5):
+        try:
+            return await bot.send_chat_action(
+                chat_id=chat_id, action=action, message_thread_id=message_thread_id
+            )
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except TimedOut:
+            await asyncio.sleep(1)
+        except BadRequest as e:
+            logger.warning(f"Failed to send chat action: {e}")
+            return None
+    return None
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the user types /start."""
     await update.message.reply_text(markdownify(
@@ -179,8 +196,8 @@ async def process_agent_turn(
         logger.error("Agent graph is not initialized.")
         return
 
-    await bot.send_chat_action(
-        chat_id=chat_id, action=constants.ChatAction.TYPING, message_thread_id=message_thread_id
+    await safe_chat_action(
+        bot, chat_id=chat_id, action=constants.ChatAction.TYPING, message_thread_id=message_thread_id
     )
 
     if status_message is None:
@@ -239,17 +256,30 @@ async def process_agent_turn(
                     last_shown_tool_status = None
                     await flush()
                 else:
-                    tool_calls = getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None)
-                    if tool_calls:
-                        names = sorted({tc.get("name") for tc in tool_calls if tc.get("name")})
-                        label = ", ".join(f"`{n}`" for n in names) if names else "a tool"
-                        tool_status = f"_⚙️ Using {label}..._"
+                    is_thinking = False
+                    if isinstance(chunk.content, list):
+                        for block in chunk.content:
+                            if isinstance(block, dict) and block.get("type") == "thinking":
+                                is_thinking = True
+                                break
+
+                    if is_thinking:
+                        tool_status = "_⚙️ Thinking..._"
                         if tool_status != last_shown_tool_status:
-                            await flush(force=True)
+                            await flush()
                             last_shown_tool_status = tool_status
-                            await bot.send_chat_action(
-                                chat_id=chat_id, action=constants.ChatAction.TYPING, message_thread_id=message_thread_id
-                            )
+                    else:
+                        tool_calls = getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None)
+                        if tool_calls:
+                            names = sorted({tc.get("name") for tc in tool_calls if tc.get("name")})
+                            label = ", ".join(f"`{n}`" for n in names) if names else "a tool"
+                            tool_status = f"_⚙️ Using {label}..._"
+                            if tool_status != last_shown_tool_status:
+                                await flush(force=True)
+                                last_shown_tool_status = tool_status
+                                await bot.send_chat_action(
+                                    chat_id=chat_id, action=constants.ChatAction.TYPING, message_thread_id=message_thread_id
+                                )
             elif node == "tools":
                 tool_status = "_⚙️ Thinking..._"
                 if tool_status != last_shown_tool_status:

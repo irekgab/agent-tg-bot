@@ -32,8 +32,8 @@ def get_graph_definition() -> StateGraph:
         tool_config={"include_server_side_tool_invocations": True},
     )
 
-    def agent_node(state: AgentState) -> AgentState:
-        response = llm_with_tools.invoke(state["messages"])
+    async def agent_node(state: AgentState) -> AgentState:
+        response = await llm_with_tools.ainvoke(state["messages"])
         return {"messages": [response]}
 
     graph = StateGraph(AgentState)
