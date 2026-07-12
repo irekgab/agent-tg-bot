@@ -22,10 +22,23 @@ hiding real errors from other loggers.
 """
 import logging
 import os
+from logging.handlers import TimedRotatingFileHandler
+
+
+class SuccessResponseFilter(logging.Filter):
+    """Filters out successful HTTP responses from the logs.
+
+    Specifically suppresses logs containing '200 OK' to prevent log flooding,
+    while allowing error responses (like 400, 429, 500) to pass through.
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        # We only want to hide the '200 OK' success messages.
+        # Error messages (e.g. '500 Internal Server Error') will not match this.
+        return "200 OK" not in record.getMessage()
 
 
 def configure_logging() -> None:
-    """Configures logging to both console and a file in .data/agent.log."""
+    """Configures logging to both console and a daily rotating file in .data/agent.log."""
     log_dir = ".data"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "agent.log")
@@ -35,7 +48,15 @@ def configure_logging() -> None:
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(log_format)
 
-    file_handler = logging.FileHandler(log_file)
+    # Use TimedRotatingFileHandler for automatic daily rotation.
+    # At midnight, the current agent.log is renamed to agent.log.YYYY-MM-DD
+    # and a new agent.log is started. backupCount=30 keeps 30 days of history.
+    file_handler = TimedRotatingFileHandler(
+        log_file, 
+        when="midnight", 
+        interval=1, 
+        backupCount=30
+    )
     file_handler.setFormatter(log_format)
 
     root_logger = logging.getLogger()
@@ -47,6 +68,14 @@ def configure_logging() -> None:
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
 
+    # Suppress noisy third-party loggers
     logging.getLogger("langchain_google_genai").setLevel(logging.ERROR)
     logging.getLogger("google_genai").setLevel(logging.ERROR)
     logging.getLogger("langchain_google_genai._function_utils").setLevel(logging.ERROR)
+    
+    # Handle httpx logging:
+    # We keep it at INFO level so we can see errors (which httpx logs as INFO),
+    # but we use a filter to specifically silence the "200 OK" success messages.
+    httpx_logger = logging.getLogger("httpx")
+    httpx_logger.setLevel(logging.INFO)
+    httpx_logger.addFilter(SuccessResponseFilter())
