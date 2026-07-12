@@ -6,6 +6,7 @@ import sqlite3
 import time
 from telegram import Update, constants
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+from telegramify_markdown import markdownify
 
 from config import TELEGRAM_BOT_TOKEN
 from graph import build_graph_async
@@ -17,14 +18,14 @@ app = None
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the user types /start."""
-    await update.message.reply_text(
+    await update.message.reply_text(markdownify(
         "*Hello! I am your AI Agent.*\n\n"
         "You can chat with me, ask me to read files, "
         "execute commands, or even make web requests!\n\n"
         "*Commands:*\n"
         "/start - Show this message\n"
-        "/clear - Reset your conversation history",
-        parse_mode=constants.ParseMode.MARKDOWN
+        "/clear - Reset your conversation history"),
+        parse_mode=constants.ParseMode.MARKDOWN_V2
     )
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -32,7 +33,6 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = str(update.effective_user.id)
     
     try:
-        # Run synchronous sqlite3 in a thread to avoid blocking the event loop
         def clear_db():
             conn = sqlite3.connect(".data/history.db")
             cursor = conn.cursor()
@@ -44,8 +44,8 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await asyncio.to_thread(clear_db)
         
         await update.message.reply_text(
-            "*Your conversation history has been cleared!* You can start a new chat now.",
-            parse_mode=constants.ParseMode.MARKDOWN
+            markdownify("Your conversation history has been cleared! You can start a new chat now."),
+            parse_mode=constants.ParseMode.MARKDOWN_V2
         )
     except Exception as e:
         logger.error(f"Error clearing history for user {user_id}: {e}")
@@ -68,12 +68,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
 
-    sent_message = await update.message.reply_text("Thinking...", parse_mode=constants.ParseMode.MARKDOWN)
+    sent_message = await update.message.reply_text(markdownify("Thinking..."), parse_mode=constants.ParseMode.MARKDOWN_V2)
 
     try:
         full_response = ""
         last_update_time = time.time()
-        update_interval = 0.2 # to avoid rate limits
+        update_interval = 0.5 # to avoid rate limits
 
         async for chunk, metadata in app.astream(
             {"messages": [{"role": "user", "content": user_text}]},
@@ -88,14 +88,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     current_time = time.time()
                     if current_time - last_update_time > update_interval:
                         try:
-                            await sent_message.edit_text(full_response + " ▌", parse_mode=constants.ParseMode.MARKDOWN)
+                            formatted_response = markdownify(full_response + " ▌");
+                            await sent_message.edit_text(formatted_response, parse_mode=constants.ParseMode.MARKDOWN_V2)
                             last_update_time = current_time
                         except Exception:
                             pass
 
         if full_response:
+            formatted_response = markdownify(full_response)
             try:
-                await sent_message.edit_text(full_response, parse_mode=constants.ParseMode.MARKDOWN)
+                await sent_message.edit_text(formatted_response, parse_mode=constants.ParseMode.MARKDOWN_V2)
             except Exception as e:
                 logger.warning(f"Markdown parsing failed for final message: {e}. Falling back to plain text.")
                 await sent_message.edit_text(full_response)
@@ -134,16 +136,13 @@ async def main() -> None:
         
         stop_event = asyncio.Event()
         try:
-            # Wait indefinitely until the process is interrupted
             await stop_event.wait()
         except asyncio.CancelledError:
-            # This is expected when the task is cancelled (e.g. on Ctrl+C)
             pass
         finally:
             logger.info("Shutting down bot...")
             await application.stop()
             await application.shutdown()
-            # The loop will exit, closing the AsyncSqliteSaver context manager
 
 if __name__ == "__main__":
     try:
