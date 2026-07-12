@@ -118,7 +118,15 @@ The agent operates in a classic cycle of execution managed by a `StateGraph`:
 
 ### `telegram_bot.py`
 - Implements a Telegram bot interface using `python-telegram-bot`.
-- Uses the Telegram `user_id` as the LangGraph `thread_id` to provide per-user conversation memory.
+- **Per-thread memory**: the LangGraph `thread_id` is built from the Telegram `user_id` *plus* the forum `message_thread_id` (when the message is inside a forum topic), via `build_thread_key()`. This means the same user gets independent conversation history in each topic/thread they write in, instead of one history shared across all of them. `/clear` clears only the calling thread's history.
+- **Rate-limit safe streaming**: `safe_edit` / `safe_send` wrap every Telegram API call with retry/backoff handling for `RetryAfter` (HTTP 429), `BadRequest` ("message is not modified", bad Markdown entities), and `TimedOut`. Live-edit frequency is throttled to `UPDATE_INTERVAL` (1s) to stay under Telegram's per-chat edit rate limit.
+- **Live status during tool use**: while the agent is calling a tool (detected via `tool_call_chunks` on streamed `agent` node chunks, and again when the `tools` node produces a result), the in-progress message is force-updated to show the text generated so far plus a `⚙️ Using <tool>...` / `⚙️ Thinking...` status line, so the message never sits stale during a tool call.
+- **Message splitting**: `process_agent_turn()` tracks how much of the running response has been "closed off" into earlier Telegram messages. Once the un-flushed remainder exceeds `SAFE_CHUNK` (3000 chars, safely under Telegram's 4096 hard limit even after Markdown escaping), it finalizes the current message and opens a new one to continue streaming into - so long responses are automatically split across multiple messages instead of erroring.
+- **Proactive / scheduled messages**: `process_agent_turn()` is the shared core for both normal replies and bot-initiated follow-ups, used via:
+  - `tools.schedule_message(delay_seconds, instruction)` - a tool the agent can call (e.g. when asked "remind me in 10 minutes") which registers a job via `application.job_queue`.
+  - `schedule_followup()` - the `tools.SCHEDULE_CALLBACK` implementation; since tools run in a worker thread, it hands off to the bot's asyncio loop via `call_soon_threadsafe` before touching the `JobQueue`.
+  - `on_scheduled_job()` - the job callback that fires after the delay, re-invokes the agent with the original instruction as context (on the same `thread_id`, so it has full conversation history), and sends the result to the chat as a new message.
+  - Scheduled jobs live in the in-memory `JobQueue` and do **not** persist across bot restarts.
 - Integrates with the existing agent graph and toolset.
 
 ### `tools.py`
@@ -133,6 +141,7 @@ The agent operates in a classic cycle of execution managed by a `StateGraph`:
   - `list_directory(path=".")`: Safely lists files and subdirectories inside the project directory.
   - `execute_command(command)`: Safely executes a terminal/shell command within the project directory and returns its output (stdout and stderr).
   - `make_web_request(url, method, headers, data, params)`: Makes an HTTP request to a specified URL.
+  - `schedule_message(delay_seconds, instruction)`: Lets the agent schedule a follow-up for itself (e.g. "remind me in 10 minutes"). Reads the current chat context from the `current_chat_context` contextvar and delegates to `SCHEDULE_CALLBACK`, both of which the host app (`telegram_bot.py`) sets up - `tools.py` itself has no Telegram-specific code. See the `telegram_bot.py` section above for how this is wired up end to end.
 
 ---
 
