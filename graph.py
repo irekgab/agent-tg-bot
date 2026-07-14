@@ -46,15 +46,6 @@ def get_graph_definition() -> StateGraph:
     
     return graph
 
-
-def build_graph() -> any:
-    """Builds the graph with a synchronous SqliteSaver (for CLI)."""
-    graph = get_graph_definition()
-    conn = sqlite3.connect(".data/history.db", check_same_thread=False)
-    memory = SqliteSaver(conn)
-    return graph.compile(checkpointer=memory)
-
-
 async def build_graph_async():
     """
     A generator that yields a compiled graph with an AsyncSqliteSaver.

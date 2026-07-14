@@ -98,14 +98,7 @@ def list_directory(path: str = ".") -> str:
 
 @tool
 def execute_command(command: str) -> str:
-    """Execute a shell command inside the workspace and return its stdout and stderr.
-
-    Args:
-        command: The shell command to execute in the terminal (e.g., 'python script.py', 'ls', 'pip install requirements.txt').
-
-    Returns:
-        The combined stdout and stderr output of the executed command, or an error message.
-    """
+    """Execute a shell command inside the workspace and return its stdout and stderr."""
     try:
         result = subprocess.run(
             command,
@@ -131,18 +124,7 @@ def execute_command(command: str) -> str:
 
 @tool
 def make_web_request(url: str, method: str = "GET", headers: dict = None, data: str = None, params: dict = None) -> str:
-    """Make an HTTP request to a specified URL (domain or IP address).
-
-    Args:
-        url: The full URL to request (e.g., 'http://example.com' or 'https://api.example.com/data').
-        method: The HTTP method to use (e.g., 'GET', 'POST', 'PUT', 'DELETE'). Defaults to 'GET'.
-        headers: A dictionary of HTTP headers to send.
-        data: The body of the request for POST/PUT requests.
-        params: A dictionary of query parameters to append to the URL.
-
-    Returns:
-        The response text or an error message.
-    """
+    """Make an HTTP request to a specified URL."""
     import requests
     try:
         response = requests.request(
@@ -160,31 +142,7 @@ def make_web_request(url: str, method: str = "GET", headers: dict = None, data: 
 
 @tool
 def schedule_message(delay_seconds: int, instruction: str) -> str:
-    """Schedule a follow-up message to be sent to this same chat later, without waiting for the user to write again.
-
-    Use this whenever the user asks to be reminded, followed up with, or
-    messaged again after some amount of time has passed (e.g. "text me in
-    10 minutes", "remind me to stretch in an hour", "check back with me
-    tomorrow"). Reply to the user immediately as you normally would to
-    confirm the follow-up is scheduled - do NOT wait silently for the delay
-    to elapse instead of answering.
-
-    When the delay elapses you will be invoked again automatically with
-    your own `instruction` given back to you as context, and whatever you
-    respond with then will be sent to the user. Write `instruction` so that
-    a future, memory-less invocation of yourself can act on it correctly
-    (e.g. "Remind the user to drink water" rather than just "reminder").
-
-    Args:
-        delay_seconds: How many seconds from now to wait before following
-            up (e.g. 600 for "in 10 minutes", 3600 for "in an hour").
-        instruction: A clear, self-contained description of what to do or
-            say when the time comes.
-
-    Returns:
-        A confirmation that the follow-up was scheduled, or an error
-        message if scheduling isn't available right now.
-    """
+    """Schedule a follow-up message to be sent to this same chat later, without waiting for the user to write again."""
     if delay_seconds is None or delay_seconds <= 0:
         return "Error: delay_seconds must be a positive number of seconds."
 

@@ -12,7 +12,7 @@ from telegramify_markdown import markdownify
 import tools
 from config import TELEGRAM_BOT_TOKEN
 from graph import build_graph_async
-from streaming import extract_text
+from llm import extract_text
 
 logger = logging.getLogger(__name__)
 
@@ -135,20 +135,6 @@ async def safe_chat_action(bot, chat_id, action, message_thread_id=None):
     return None
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message when the user types /start."""
-    await update.message.reply_text(markdownify(
-        "*Hello! I am your AI Agent.*\n\n"
-        "You can chat with me, ask me to read files, "
-        "execute commands, make web requests, or ask me to "
-        "follow up with you later (e.g. \"remind me in 10 minutes\")!\n\n"
-        "*Commands:*\n"
-        "/start - Show this message\n"
-        "/clear - Reset your conversation history"),
-        parse_mode=constants.ParseMode.MARKDOWN_V2
-    )
-
-
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Clears the conversation history for the current user/thread."""
     user_id = update.effective_user.id
@@ -185,60 +171,63 @@ async def process_agent_turn(
     """Run one turn of the agent for (chat_id, thread_key) and stream the
     reply into Telegram, splitting across messages if the reply grows past
     Telegram's length limit and showing live status while tools run.
-
-    This is the shared core used both for direct user replies and for
-    scheduled follow-ups triggered by the `schedule_message` tool, so both
-    paths get the same rate-limit handling, tool-status feedback, and
-    message-splitting behaviour.
     """
     global app
     if app is None:
         logger.error("Agent graph is not initialized.")
         return
 
-    await safe_chat_action(
-        bot, chat_id=chat_id, action=constants.ChatAction.TYPING, message_thread_id=message_thread_id
-    )
-
-    if status_message is None:
-        status_message = await safe_send(bot, chat_id, "...", message_thread_id=message_thread_id)
-
     config = {"configurable": {"thread_id": thread_key}}
     token = tools.current_chat_context.set(
         {"chat_id": chat_id, "message_thread_id": message_thread_id, "thread_key": thread_key}
     )
 
-    current_message = status_message
+    current_message = None
     full_response = ""
     flushed_len = 0
     last_update_time = 0.0
     tool_status = None
     last_shown_tool_status = None
 
-    async def flush(force: bool = False, final: bool = False) -> None:
+
+    async def wait_interval():
+        nonlocal last_update_time
+        now = time.monotonic()
+        delay = UPDATE_INTERVAL - (now - last_update_time)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        last_update_time = time.monotonic()
+
+
+    async def flush(final: bool = False) -> None:
         nonlocal current_message, flushed_len, last_update_time, tool_status
         pending = full_response[flushed_len:]
 
         while len(pending) > SAFE_CHUNK:
-            chunk, pending = split_chunk(pending, SAFE_CHUNK)
-            await safe_edit(current_message, chunk, with_cursor=False)
+            chunk, pending = split_chunk(pending)
+
+            if current_message is None:
+                current_message = await safe_send(bot, chat_id, chunk, message_thread_id=message_thread_id)
+            else:
+                await wait_interval()
+                await safe_edit(current_message, chunk)
+
             flushed_len += len(chunk)
-            current_message = await safe_send(bot, chat_id, "…", message_thread_id=message_thread_id)
-            last_update_time = 0.0
-
-        now = time.time()
-        if not force and not final and (now - last_update_time) < UPDATE_INTERVAL:
-            return
-
+            current_message = None
+        
         body = pending
         if tool_status and not final:
             body = (body + "\n\n" if body else "") + tool_status
-        if not body:
-            body = "..." if not final else "I'm sorry, I couldn't generate a response."
 
-        with_cursor = (not final) and bool(pending) and not tool_status
-        await safe_edit(current_message, body, with_cursor=with_cursor)
-        last_update_time = now
+        with_cursor = (not final and not tool_status and flushed_len + len(pending) == len(full_response))
+
+        if current_message is None:
+            if body is not None:
+                current_message = await safe_send(bot, chat_id, body, message_thread_id=message_thread_id, with_cursor=with_cursor)
+        else:
+            await wait_interval()
+            await safe_edit(current_message, body, with_cursor=with_cursor)
+
 
     try:
         async for chunk, metadata in app.astream(
@@ -247,57 +236,25 @@ async def process_agent_turn(
             stream_mode="messages",
         ):
             node = metadata.get("langgraph_node")
-
-            if node == "agent":
-                text = extract_text(chunk.content)
-                if text:
-                    full_response += text
-                    tool_status = None
-                    last_shown_tool_status = None
-                    await flush()
-                else:
-                    is_thinking = False
-                    if isinstance(chunk.content, list):
-                        for block in chunk.content:
-                            if isinstance(block, dict) and block.get("type") == "thinking":
-                                is_thinking = True
-                                break
-
-                    if is_thinking:
-                        tool_status = "_⚙️ Thinking..._"
-                        if tool_status != last_shown_tool_status:
-                            await flush()
-                            last_shown_tool_status = tool_status
-                    else:
-                        tool_calls = getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None)
-                        if tool_calls:
-                            names = sorted({tc.get("name") for tc in tool_calls if tc.get("name")})
-                            label = ", ".join(f"`{n}`" for n in names) if names else "a tool"
-                            tool_status = f"_⚙️ Using {label}..._"
-                            if tool_status != last_shown_tool_status:
-                                await flush(force=True)
-                                last_shown_tool_status = tool_status
-                                await bot.send_chat_action(
-                                    chat_id=chat_id, action=constants.ChatAction.TYPING, message_thread_id=message_thread_id
-                                )
-            elif node == "tools":
+            
+            text = extract_text(chunk.content)
+            if node == "agent" and text:
+                full_response += text
+                tool_status = None
+                last_shown_tool_status = None
+                await flush()
+            else:
                 tool_status = "_⚙️ Thinking..._"
                 if tool_status != last_shown_tool_status:
-                    await flush(force=True)
+                    await flush()
                     last_shown_tool_status = tool_status
-                    await bot.send_chat_action(
-                        chat_id=chat_id, action=constants.ChatAction.TYPING, message_thread_id=message_thread_id
-                    )
 
         tool_status = None
-        await flush(force=True, final=True)
+        await flush(final=True)
 
     except Exception as e:
         logger.error(f"Error processing message for thread {thread_key}: {e}")
-        try:
-            await safe_edit(current_message, "An error occurred while processing your request. Please try again later.")
-        except Exception:
-            pass
+        await safe_send(bot, chat_id, "An error occurred while processing your request. Please try again later.", message_thread_id=message_thread_id)
     finally:
         tools.current_chat_context.reset(token)
 
@@ -375,7 +332,6 @@ async def main() -> None:
 
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("clear", clear_command))
 
     message_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
