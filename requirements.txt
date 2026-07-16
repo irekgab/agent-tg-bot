@@ -1,5 +1,6 @@
 langgraph>=0.2
 langchain-google-genai>=2.0
+pydantic>=2.0
 python-dotenv>=1.0
 langgraph-checkpoint-sqlite>=3.1.0
 requests

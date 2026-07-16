@@ -9,13 +9,25 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from config import LLM_API_KEY, MODEL_NAME
 
 
-def build_llm(temperature: float = 0.7) -> Any:
-    """Create a chat model instance configured from environment settings."""
-    llm = ChatGoogleGenerativeAI(
+def build_raw_llm(temperature: float = 0.7) -> ChatGoogleGenerativeAI:
+    """Create a bare chat model instance, with none of build_llm()'s .bind()-ed extras.
+
+    build_llm() wraps the model in a generic RunnableBinding (via .bind()),
+    which doesn't forward model-specific methods like .with_structured_output().
+    Use this factory instead whenever you need those methods - e.g. the
+    planner/replanner in graph.py, which need structured (JSON) output rather
+    than free-form tool-calling.
+    """
+    return ChatGoogleGenerativeAI(
         model=MODEL_NAME,
         google_api_key=LLM_API_KEY,
         temperature=temperature,
     )
+
+
+def build_llm(temperature: float = 0.7) -> Any:
+    """Create a chat model instance configured from environment settings."""
+    llm = build_raw_llm(temperature=temperature)
 
     # We use .bind() to inject custom HTTP retry options. This ensures that 
     # transient 500 errors are retried with a constant delay (exp_base=1.0) 

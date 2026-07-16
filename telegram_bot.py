@@ -21,8 +21,37 @@ application = None
 MAIN_LOOP: asyncio.AbstractEventLoop = None
 
 SAFE_CHUNK = 4095
-
 UPDATE_INTERVAL = 1.0
+MESSAGE_COMBINE_DELAY = 1.5
+
+# Per-thread pending-message buffers, and the debounce task currently
+# waiting to flush each one. Guarded by _pending_guard purely for
+# safety/clarity - the section it protects never awaits, so it's already
+# atomic under asyncio's cooperative scheduling, but a lock costs nothing
+# here and keeps this robust if that ever changes.
+_pending_messages: dict[str, list[str]] = {}
+_pending_tasks: dict[str, asyncio.Task] = {}
+_pending_guard = asyncio.Lock()
+
+# Per-thread-key locks. concurrent_updates(True) (set on the Application
+# below) lets PTB dispatch updates for different chats/threads fully in
+# parallel instead of queuing behind whichever update happens to be
+# in-flight - but two overlapping turns for the *same* thread_key (e.g. a
+# live message arriving right as a scheduled follow-up fires) would then
+# race on the same LangGraph checkpointer row. These locks keep each
+# individual thread's turns sequential while leaving different threads
+# fully concurrent.
+_thread_locks: dict[str, asyncio.Lock] = {}
+_thread_locks_guard = asyncio.Lock()
+
+
+async def _get_thread_lock(thread_key: str) -> asyncio.Lock:
+    async with _thread_locks_guard:
+        lock = _thread_locks.get(thread_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _thread_locks[thread_key] = lock
+        return lock
 
 
 def build_thread_key(user_id: int, message_thread_id: int | None) -> str:
@@ -149,7 +178,9 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             conn.commit()
             conn.close()
 
-        await asyncio.to_thread(clear_db)
+        lock = await _get_thread_lock(thread_key)
+        async with lock:
+            await asyncio.to_thread(clear_db)
 
         await update.message.reply_text(
             markdownify("Your conversation history has been cleared! You can start a new chat now."),
@@ -177,6 +208,19 @@ async def process_agent_turn(
         logger.error("Agent graph is not initialized.")
         return
 
+    lock = await _get_thread_lock(thread_key)
+    async with lock:
+        await _run_agent_turn(bot, chat_id, thread_key, user_content, message_thread_id)
+
+
+async def _run_agent_turn(
+    bot,
+    chat_id: int,
+    thread_key: str,
+    user_content: str,
+    message_thread_id=None,
+) -> None:
+    """The actual turn logic, run while holding this thread_key's lock."""
     config = {"configurable": {"thread_id": thread_key}}
     token = tools.current_chat_context.set(
         {"chat_id": chat_id, "message_thread_id": message_thread_id, "thread_key": thread_key}
@@ -188,6 +232,7 @@ async def process_agent_turn(
     last_update_time = 0.0
     tool_status = None
     last_shown_tool_status = None
+    stage_boundary_pending = False
 
 
     async def wait_interval():
@@ -239,12 +284,16 @@ async def process_agent_turn(
             
             text = extract_text(chunk.content)
             if node == "agent" and text:
+                if stage_boundary_pending and full_response:
+                    full_response += "\n\n\n"
+                stage_boundary_pending = False
                 full_response += text
                 tool_status = None
                 last_shown_tool_status = None
                 await flush()
             else:
                 tool_status = "_⚙️ Thinking..._"
+                stage_boundary_pending = True
                 if tool_status != last_shown_tool_status:
                     await flush()
                     last_shown_tool_status = tool_status
@@ -260,7 +309,12 @@ async def process_agent_turn(
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming text messages from Telegram users with streaming responses and Markdown support."""
+    """Handles incoming text messages from Telegram users with streaming responses and Markdown support.
+
+    Doesn't process immediately - briefly buffers per-thread so that if
+    Telegram has split one long paste into several messages, they get
+    combined into a single turn instead of being treated as separate ones.
+    """
     user_id = update.effective_user.id
     user_text = update.message.text
     if not user_text:
@@ -268,12 +322,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     message_thread_id = get_message_thread_id(update)
     thread_key = build_thread_key(user_id, message_thread_id)
+    chat_id = update.effective_chat.id
+    bot = context.bot
 
+    async with _pending_guard:
+        is_first_in_batch = thread_key not in _pending_messages
+        _pending_messages.setdefault(thread_key, []).append(user_text)
+
+        existing_task = _pending_tasks.get(thread_key)
+        if existing_task and not existing_task.done():
+            existing_task.cancel()
+        _pending_tasks[thread_key] = asyncio.create_task(
+            _flush_pending_after_delay(bot, chat_id, thread_key, message_thread_id)
+        )
+
+    if is_first_in_batch:
+        # Let the user know we've seen something right away, since actual
+        # processing is now delayed by MESSAGE_COMBINE_DELAY (plus however
+        # long the agent itself takes).
+        await safe_chat_action(bot, chat_id, constants.ChatAction.TYPING, message_thread_id=message_thread_id)
+
+
+async def _flush_pending_after_delay(bot, chat_id, thread_key: str, message_thread_id) -> None:
+    """Waits MESSAGE_COMBINE_DELAY; if not superseded by a newer message in
+    the same thread arriving first (which cancels this task), combines and
+    processes everything buffered for this thread as one turn."""
+    try:
+        await asyncio.sleep(MESSAGE_COMBINE_DELAY)
+    except asyncio.CancelledError:
+        return  # A newer message reset the timer; its own task will flush.
+
+    async with _pending_guard:
+        texts = _pending_messages.pop(thread_key, [])
+        _pending_tasks.pop(thread_key, None)
+
+    if not texts:
+        return
+
+    combined_text = "\n\n".join(texts)
     await process_agent_turn(
-        context.bot,
-        chat_id=update.effective_chat.id,
+        bot,
+        chat_id=chat_id,
         thread_key=thread_key,
-        user_content=user_text,
+        user_content=combined_text,
         message_thread_id=message_thread_id,
     )
 
@@ -330,7 +421,7 @@ async def main() -> None:
     MAIN_LOOP = asyncio.get_running_loop()
     tools.SCHEDULE_CALLBACK = schedule_followup
 
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
     application.add_handler(CommandHandler("clear", clear_command))
 
