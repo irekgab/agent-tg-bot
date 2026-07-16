@@ -17,7 +17,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import BaseModel, Field
 
-from llm import build_llm, build_raw_llm
+from llm import build_llm, build_raw_llm, extract_planner_text
 from tools import TOOLS
 
 
@@ -89,17 +89,25 @@ is_complete to false and list ONLY the steps that still remain - never \
 repeat a step whose result already appears below."""
 
 
-def _step_task_message(plan: List[str]) -> HumanMessage:
+def _step_task_message(plan: List[str], latest_human_message: HumanMessage) -> HumanMessage:
     """Build the scoped instruction for executing plan[0] - and only plan[0]."""
     plan_str = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(plan))
-    return HumanMessage(
-        content=(
-            f"Full plan (for context only, do not act on the other steps):\n{plan_str}\n\n"
-            f"Execute ONLY this step now:\n1. {plan[0]}\n\n"
-            "Give your final answer for this step alone; do not mention or "
-            "address any other step."
-        )
+    
+    instruction = (
+        f"\n\nFull plan (for context only, do not act on the other steps):\n{plan_str}\n\n"
+        f"Execute ONLY this step now:\n1. {plan[0]}\n\n"
+        "Give your final answer for this step alone; do not mention or "
+        "address any other step."
     )
+    
+    if isinstance(latest_human_message.content, list):
+        # We need to make sure we don't modify the original content object if it's a list (it's mutable)
+        new_content = list(latest_human_message.content)
+        new_content.append({"type": "text", "text": instruction})
+    else:
+        new_content = f"{latest_human_message.content}{instruction}"
+        
+    return HumanMessage(content=new_content)
 
 
 def _replace_step_messages(old_messages: list, new_message: HumanMessage) -> list:
@@ -130,12 +138,23 @@ def get_graph_definition() -> StateGraph:
         }
 
     async def plan_step(state: AgentState) -> AgentState:
-        plan = await planner.ainvoke([("system", PLANNER_SYSTEM_PROMPT), *state["messages"]])
+        # Prepare the messages for the planner
+        planner_messages = [("system", PLANNER_SYSTEM_PROMPT)]
+        for m in state["messages"]:
+            if isinstance(m, HumanMessage):
+                planner_messages.append(("human", extract_planner_text(m.content)))
+            elif isinstance(m, AIMessage):
+                planner_messages.append(("ai", extract_planner_text(m.content)))
+        
+        plan = await planner.ainvoke(planner_messages)
         steps = plan.steps or ["Respond to the user's request."]
+        
+        latest_human = next(m for m in reversed(state["messages"]) if isinstance(m, HumanMessage))
+        
         return {
             "plan": steps,
             "current_task": steps[0],
-            "step_messages": _replace_step_messages(state["step_messages"], _step_task_message(steps)),
+            "step_messages": _replace_step_messages(state["step_messages"], _step_task_message(steps, latest_human)),
         }
 
     async def agent_node(state: AgentState) -> AgentState:
@@ -170,10 +189,9 @@ def get_graph_definition() -> StateGraph:
         past_steps_str = "\n\n".join(
             f"Step: {task}\nResult: {result}" for task, result in state["past_steps"]
         )
-        original_request = next(
-            (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
-            "",
-        )
+        latest_human = next(m for m in reversed(state["messages"]) if isinstance(m, HumanMessage))
+        original_request = extract_planner_text(latest_human.content)
+
         prompt = (
             f"Original request:\n{original_request}\n\n"
             f"Original plan:\n" + "\n".join(f"- {s}" for s in state["plan"]) + "\n\n"
@@ -186,7 +204,7 @@ def get_graph_definition() -> StateGraph:
         return {
             "plan": new_plan,
             "current_task": new_plan[0],
-            "step_messages": _replace_step_messages(state["step_messages"], _step_task_message(new_plan)),
+            "step_messages": _replace_step_messages(state["step_messages"], _step_task_message(new_plan, latest_human)),
         }
 
     def route_after_replan(state: AgentState) -> str:

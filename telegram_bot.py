@@ -2,6 +2,7 @@ import logging
 from logging_config import configure_logging
 
 import asyncio
+import base64
 import sqlite3
 import time
 from telegram import Update, constants
@@ -23,6 +24,7 @@ MAIN_LOOP: asyncio.AbstractEventLoop = None
 SAFE_CHUNK = 4095
 UPDATE_INTERVAL = 1.0
 MESSAGE_COMBINE_DELAY = 1.5
+MAX_FILE_BYTES = 256 * 1024 * 1024
 
 # Per-thread pending-message buffers, and the debounce task currently
 # waiting to flush each one. Guarded by _pending_guard purely for
@@ -343,6 +345,102 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await safe_chat_action(bot, chat_id, constants.ChatAction.TYPING, message_thread_id=message_thread_id)
 
 
+async def _download_as_content_blocks(bot, file_id: str, mime_type: str, text_note: str | None):
+    """Download a Telegram file and turn it into LangChain multimodal
+    content blocks: an optional leading text block (caption/filename note),
+    plus an image or generic media block carrying the base64 file data.
+
+    Returns (blocks, error_message) - exactly one of the two is set. Images
+    use the image_url data-URI form; everything else (PDFs, text files,
+    audio, etc.) uses the generic media block, keyed by its mime type -
+    this is the multimodal content format langchain-google-genai expects.
+    """
+    try:
+        tg_file = await bot.get_file(file_id)
+    except Exception as exc:
+        logger.warning(f"Failed to fetch Telegram file {file_id}: {exc}")
+        return None, "Sorry, I couldn't fetch that file from Telegram. Please try again."
+
+    if tg_file.file_size and tg_file.file_size > MAX_FILE_BYTES:
+        limit_mb = MAX_FILE_BYTES // (1024 * 1024)
+        return None, f"That file is too large for me to process (the limit is {limit_mb} MB)."
+
+    try:
+        raw = await tg_file.download_as_bytearray()
+    except Exception as exc:
+        logger.warning(f"Failed to download Telegram file {file_id}: {exc}")
+        return None, "Sorry, I couldn't download that file from Telegram. Please try again."
+
+    encoded = base64.b64encode(bytes(raw)).decode("ascii")
+
+    blocks = []
+    if text_note:
+        blocks.append({"type": "text", "text": text_note})
+    if mime_type.startswith("image/"):
+        blocks.append({"type": "image_url", "image_url": f"data:{mime_type};base64,{encoded}"})
+    else:
+        blocks.append({"type": "media", "mime_type": mime_type, "data": encoded})
+    return blocks, None
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles incoming photos: downloads the highest-resolution size and
+    hands it to the agent as an image (plus any caption), so the LLM can
+    actually see what was sent rather than just being told about it."""
+    if not update.message.photo:
+        return
+
+    user_id = update.effective_user.id
+    message_thread_id = get_message_thread_id(update)
+    thread_key = build_thread_key(user_id, message_thread_id)
+
+    photo = update.message.photo[-1]  # last entry = highest resolution
+    blocks, error = await _download_as_content_blocks(
+        context.bot, photo.file_id, "image/jpeg", update.message.caption
+    )
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    await process_agent_turn(
+        context.bot,
+        chat_id=update.effective_chat.id,
+        thread_key=thread_key,
+        user_content=blocks,
+        message_thread_id=message_thread_id,
+    )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles incoming documents/files: downloads the file and hands it to
+    the agent (as an image or generic media block, depending on mime type)
+    plus any caption, or a filename note if there's no caption."""
+    document = update.message.document
+    if document is None:
+        return
+
+    user_id = update.effective_user.id
+    message_thread_id = get_message_thread_id(update)
+    thread_key = build_thread_key(user_id, message_thread_id)
+
+    mime_type = document.mime_type or "application/octet-stream"
+    text_note = update.message.caption or (
+        f"[Attached file: {document.file_name}]" if document.file_name else None
+    )
+    blocks, error = await _download_as_content_blocks(context.bot, document.file_id, mime_type, text_note)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    await process_agent_turn(
+        context.bot,
+        chat_id=update.effective_chat.id,
+        thread_key=thread_key,
+        user_content=blocks,
+        message_thread_id=message_thread_id,
+    )
+
+
 async def _flush_pending_after_delay(bot, chat_id, thread_key: str, message_thread_id) -> None:
     """Waits MESSAGE_COMBINE_DELAY; if not superseded by a newer message in
     the same thread arriving first (which cancels this task), combines and
@@ -424,6 +522,8 @@ async def main() -> None:
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
     application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     message_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
     application.add_handler(message_handler)
