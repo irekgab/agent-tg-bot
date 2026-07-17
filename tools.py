@@ -54,6 +54,16 @@ current_chat_context: contextvars.ContextVar = contextvars.ContextVar(
 # the same chat/thread.
 SCHEDULE_CALLBACK = None
 
+# Set by the host app at startup: a callable with signature
+# (chat_id, message_thread_id, thread_key, path, caption) -> (success, error)
+# that actually sends the file to the user (e.g. via the Telegram Bot API)
+# and reports back whether it worked. Unlike SCHEDULE_CALLBACK this one is
+# awaited for its result, since the agent needs to know whether the send
+# actually succeeded.
+SEND_FILE_CALLBACK = None
+
+MAX_SEND_FILE_BYTES = 50 * 1024 * 1024  # Telegram Bot API's own upload limit
+
 
 def _current_thread_key() -> str:
     """The thread_key for whichever chat this tool call is running inside,
@@ -195,6 +205,44 @@ def remember_about_chat(content: str) -> str:
         return f"Error updating chat notes: {exc}"
 
 
+@tool
+def send_file_to_user(path: str, caption: str = "") -> str:
+    """Send a file from this chat's workspace to the user, e.g. a document,
+    PDF, spreadsheet, or image you generated with write_file, or one the
+    user uploaded earlier. `path` must be a file already inside this
+    chat's workspace. Images (.jpg/.jpeg/.png/.gif/.webp) are sent as
+    photos; everything else is sent as a document. `caption` is optional."""
+    ctx = current_chat_context.get()
+    if ctx is None or SEND_FILE_CALLBACK is None:
+        return "Error: sending files isn't available in this context."
+
+    try:
+        full_path = _resolve_safe_path(path)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+    if not os.path.isfile(full_path):
+        return f"Error: '{path}' does not exist in the workspace."
+
+    size = os.path.getsize(full_path)
+    if size > MAX_SEND_FILE_BYTES:
+        return (
+            f"Error: '{path}' is {size / (1024 * 1024):.1f} MB, which "
+            f"exceeds Telegram's {MAX_SEND_FILE_BYTES // (1024 * 1024)} MB upload limit."
+        )
+
+    try:
+        success, error = SEND_FILE_CALLBACK(
+            ctx["chat_id"], ctx.get("message_thread_id"), ctx["thread_key"], full_path, caption
+        )
+    except Exception as exc:
+        return f"Error sending file: {exc}"
+
+    if not success:
+        return f"Error sending file: {error}"
+    return f"Sent '{path}' to the user."
+
+
 TOOLS = [
     get_current_time,
     read_file,
@@ -204,4 +252,5 @@ TOOLS = [
     make_web_request,
     schedule_message,
     remember_about_chat,
+    send_file_to_user,
 ]

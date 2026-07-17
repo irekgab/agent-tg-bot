@@ -6,7 +6,7 @@ import base64
 import os
 import sqlite3
 import time
-from telegram import Update, constants
+from telegram import Update, constants, InputFile
 from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 from telegramify_markdown import markdownify
@@ -25,8 +25,8 @@ MAIN_LOOP: asyncio.AbstractEventLoop = None
 
 SAFE_CHUNK = 4095
 UPDATE_INTERVAL = 1.0
-MESSAGE_COMBINE_DELAY = 1.5
-MAX_FILE_BYTES = 256 * 1024 * 1024
+MESSAGE_COMBINE_DELAY = 1.0
+MAX_FILE_BYTES = 20 * 1024 * 1024 # Telegram Bot API's own upload limit
 
 # Per-thread pending-message buffers, and the debounce task currently
 # waiting to flush each one. Guarded by _pending_guard purely for
@@ -333,12 +333,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             _flush_pending_after_delay(bot, chat_id, thread_key, message_thread_id)
         )
 
-    if is_first_in_batch:
-        # Let the user know we've seen something right away, since actual
-        # processing is now delayed by MESSAGE_COMBINE_DELAY (plus however
-        # long the agent itself takes).
-        await safe_chat_action(bot, chat_id, constants.ChatAction.TYPING, message_thread_id=message_thread_id)
-
 
 def _save_uploaded_file(thread_key: str, filename: str, raw: bytes) -> None:
     """Save a user-sent file into this chat's workspace/uploads"""
@@ -524,12 +518,86 @@ async def on_scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
+
+
+async def _send_file(chat_id, message_thread_id, path: str, caption: str):
+    """Actually sends a document or photo to the user. Runs on the bot's
+    event loop (invoked via send_file_callback below). Returns
+    (success, error_message)."""
+    filename = os.path.basename(path)
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    is_image = ext in IMAGE_EXTENSIONS
+
+    try:
+        formatted_caption = markdownify(caption) if caption else None
+        parse_mode = constants.ParseMode.MARKDOWN_V2
+    except Exception:
+        formatted_caption = caption or None
+        parse_mode = None
+
+    for _ in range(5):
+        try:
+            with open(path, "rb") as f:
+                file_obj = InputFile(f, filename=filename)
+                if is_image:
+                    await application.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=file_obj,
+                        caption=formatted_caption,
+                        parse_mode=parse_mode,
+                        message_thread_id=message_thread_id,
+                    )
+                else:
+                    await application.bot.send_document(
+                        chat_id=chat_id,
+                        document=file_obj,
+                        caption=formatted_caption,
+                        parse_mode=parse_mode,
+                        message_thread_id=message_thread_id,
+                    )
+            return True, None
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except BadRequest as e:
+            if parse_mode is not None:
+                formatted_caption, parse_mode = (caption or None), None
+                continue
+            logger.warning(f"Failed to send file {path}: {e}")
+            return False, str(e)
+        except TimedOut:
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.warning(f"Failed to send file {path}: {e}")
+            return False, str(e)
+    return False, "Failed to send file after multiple retries."
+
+
+def send_file_callback(chat_id, message_thread_id, thread_key, path, caption):
+    """Registered as tools.SEND_FILE_CALLBACK. Called synchronously from a
+    tool-execution worker thread. Unlike schedule_followup this needs to
+    report success/failure back to the agent, so - rather than just firing
+    off a callback - it schedules the actual send on the bot's event loop
+    via run_coroutine_threadsafe and blocks this worker thread on the
+    result."""
+    if application is None or MAIN_LOOP is None:
+        return False, "Bot is not running."
+    future = asyncio.run_coroutine_threadsafe(
+        _send_file(chat_id, message_thread_id, path, caption), MAIN_LOOP
+    )
+    try:
+        return future.result(timeout=60)
+    except Exception as exc:
+        return False, str(exc)
+
+
 async def main() -> None:
     """Starts the Telegram bot."""
     global application, MAIN_LOOP
     configure_logging()
     MAIN_LOOP = asyncio.get_running_loop()
     tools.SCHEDULE_CALLBACK = schedule_followup
+    tools.SEND_FILE_CALLBACK = send_file_callback
 
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 

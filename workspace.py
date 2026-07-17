@@ -17,11 +17,10 @@ Disk layout:
 """
 import os
 import re
+from config import AGENT_WORKSPACE, AGENT_INSTRUCTIONS_FILE
 
-WORKSPACE_ROOT = os.path.abspath(os.getenv("AGENT_WORKSPACE", ".data/workspaces"))
-GLOBAL_INSTRUCTIONS_PATH = os.path.abspath(
-    os.getenv("AGENT_INSTRUCTIONS_FILE", "AGENT_INSTRUCTIONS.md")
-)
+WORKSPACE_ROOT = AGENT_WORKSPACE
+GLOBAL_INSTRUCTIONS_PATH = AGENT_INSTRUCTIONS_FILE
 
 NOTES_FILENAME = "notes.md"
 UPLOADS_DIRNAME = "uploads"

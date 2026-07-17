@@ -22,5 +22,7 @@ def _require_env(name: str, default: str | None = None) -> str:
 
 
 LLM_API_KEY: str = _require_env("LLM_API_KEY")
-MODEL_NAME: str = _require_env("MODEL_NAME", "gemma-4-26b-a4b-it")
+MODEL_NAME: str = _require_env("MODEL_NAME")
 TELEGRAM_BOT_TOKEN: str = _require_env("TELEGRAM_BOT_TOKEN")
+AGENT_WORKSPACE: str = _require_env("AGENT_WORKSPACE")
+AGENT_INSTRUCTIONS_FILE: str = _require_env("AGENT_INSTRUCTIONS_FILE")

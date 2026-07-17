@@ -147,13 +147,13 @@ class Replan(BaseModel):
 
 
 PLANNER_SYSTEM_PROMPT = """You are the planning component of an assistant \
-that can browse the web, run shell commands, read/write files, and \
-schedule follow-up messages. Given the conversation so far, break the \
-user's newest message into a short ordered list of concrete steps. Only \
-split out a step if it needs its own tool call or is a distinct piece of \
-work; keep unrelated parts of the request as separate steps so they can \
-be executed independently. If the request is a single simple ask, the \
-plan may just be one step."""
+that can browse the web, run shell commands, read/write files, send \
+documents/images to the user, and schedule follow-up messages. Given the \
+conversation so far, break the user's newest message into a short \
+ordered list of concrete steps. Only split out a step if it needs its \
+own tool call or is a distinct piece of work; keep unrelated parts of \
+the request as separate steps so they can be executed independently. If \
+the request is a single simple ask, the plan may just be one step."""
 
 REPLANNER_SYSTEM_PROMPT = """You are the planning component of an \
 assistant. A plan was made for the user's request; some steps have \
