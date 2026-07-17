@@ -78,9 +78,9 @@ def _current_thread_key() -> str:
 
 def _resolve_safe_path(path: str) -> str:
     """Resolve a path and ensure it stays inside this chat's own workspace."""
-    base = ws.workspace_dir(_current_thread_key())
+    base = os.path.abspath(ws.workspace_dir(_current_thread_key()))
     full_path = os.path.abspath(os.path.join(base, path))
-    if not full_path.startswith(base):
+    if not (full_path == base or full_path.startswith(base + os.path.sep)):
         raise ValueError(f"Access denied: '{path}' is outside the allowed workspace.")
     return full_path
 
