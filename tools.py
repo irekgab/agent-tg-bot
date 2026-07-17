@@ -2,6 +2,11 @@
 
 Add new tools here as plain functions decorated with @tool, then add
 them to the TOOLS list. Keep each tool small and single-purpose.
+
+File tools (read_file/write_file/list_directory/remember_about_chat)
+operate inside the *current chat's own workspace* - see workspace.py -
+resolved via the current_chat_context contextvar below, the same
+mechanism schedule_message uses to find its way back to the right chat.
 """
 import re
 import os
@@ -11,8 +16,7 @@ from datetime import datetime, timezone
 
 from langchain_core.tools import tool
 
-
-WORKSPACE_DIR = os.path.abspath(os.getenv("AGENT_WORKSPACE", "."))
+import workspace as ws
 
 GOOGLE_SEARCH_TOOL = {"google_search": {}}
 
@@ -51,10 +55,22 @@ current_chat_context: contextvars.ContextVar = contextvars.ContextVar(
 SCHEDULE_CALLBACK = None
 
 
+def _current_thread_key() -> str:
+    """The thread_key for whichever chat this tool call is running inside,
+    from the same contextvar schedule_message uses. Falls back to a fixed
+    key when there's no chat context (e.g. running tools outside the bot),
+    keeping that case fully separate from any real chat's files."""
+    ctx = current_chat_context.get()
+    if ctx is None:
+        return "_default"
+    return ctx["thread_key"]
+
+
 def _resolve_safe_path(path: str) -> str:
-    """Resolve a path and ensure it stays inside WORKSPACE_DIR."""
-    full_path = os.path.abspath(os.path.join(WORKSPACE_DIR, path))
-    if not full_path.startswith(WORKSPACE_DIR):
+    """Resolve a path and ensure it stays inside this chat's own workspace."""
+    base = ws.workspace_dir(_current_thread_key())
+    full_path = os.path.abspath(os.path.join(base, path))
+    if not full_path.startswith(base):
         raise ValueError(f"Access denied: '{path}' is outside the allowed workspace.")
     return full_path
 
@@ -105,7 +121,7 @@ def execute_command(command: str) -> str:
             shell=True,
             capture_output=True,
             text=True,
-            cwd=WORKSPACE_DIR,
+            cwd=ws.workspace_dir(_current_thread_key()),
             timeout=120,
         )
         output = []
@@ -164,6 +180,21 @@ def schedule_message(delay_seconds: int, instruction: str) -> str:
     return f"Follow-up scheduled in {delay_seconds} second(s)."
 
 
+@tool
+def remember_about_chat(content: str) -> str:
+    """Overwrite this chat's persistent notes (a Markdown file) with the
+    given content. Use this to save durable context about this user or
+    conversation - preferences, ongoing projects, names, prior decisions -
+    that should stay available even after old messages get summarized
+    away or the chat history is cleared. This REPLACES whatever was saved
+    before, so include everything still worth keeping, not just what's new."""
+    try:
+        ws.write_chat_notes(_current_thread_key(), content)
+        return "Chat notes updated."
+    except Exception as exc:
+        return f"Error updating chat notes: {exc}"
+
+
 TOOLS = [
     get_current_time,
     read_file,
@@ -172,4 +203,5 @@ TOOLS = [
     execute_command,
     make_web_request,
     schedule_message,
+    remember_about_chat,
 ]

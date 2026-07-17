@@ -3,6 +3,7 @@ from logging_config import configure_logging
 
 import asyncio
 import base64
+import os
 import sqlite3
 import time
 from telegram import Update, constants
@@ -11,6 +12,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, Comma
 from telegramify_markdown import markdownify
 
 import tools
+import workspace
 from config import TELEGRAM_BOT_TOKEN
 from graph import build_graph_async
 from llm import extract_text
@@ -167,7 +169,7 @@ async def safe_chat_action(bot, chat_id, action, message_thread_id=None):
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clears the conversation history for the current user/thread."""
+    """Clears the conversation history and this chat's whole workspace"""
     user_id = update.effective_user.id
     thread_key = build_thread_key(user_id, get_message_thread_id(update))
 
@@ -183,6 +185,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lock = await _get_thread_lock(thread_key)
         async with lock:
             await asyncio.to_thread(clear_db)
+            await asyncio.to_thread(workspace.delete_workspace, thread_key)
 
         await update.message.reply_text(
             markdownify("Your conversation history has been cleared! You can start a new chat now."),
@@ -201,10 +204,7 @@ async def process_agent_turn(
     message_thread_id=None,
     status_message=None,
 ) -> None:
-    """Run one turn of the agent for (chat_id, thread_key) and stream the
-    reply into Telegram, splitting across messages if the reply grows past
-    Telegram's length limit and showing live status while tools run.
-    """
+    """Run one turn of the agent for (chat_id, thread_key) and stream the reply into Telegram """
     global app
     if app is None:
         logger.error("Agent graph is not initialized.")
@@ -311,12 +311,7 @@ async def _run_agent_turn(
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming text messages from Telegram users with streaming responses and Markdown support.
-
-    Doesn't process immediately - briefly buffers per-thread so that if
-    Telegram has split one long paste into several messages, they get
-    combined into a single turn instead of being treated as separate ones.
-    """
+    """Handles incoming text messages from Telegram users with streaming responses and Markdown support."""
     user_id = update.effective_user.id
     user_text = update.message.text
     if not user_text:
@@ -345,16 +340,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await safe_chat_action(bot, chat_id, constants.ChatAction.TYPING, message_thread_id=message_thread_id)
 
 
-async def _download_as_content_blocks(bot, file_id: str, mime_type: str, text_note: str | None):
-    """Download a Telegram file and turn it into LangChain multimodal
-    content blocks: an optional leading text block (caption/filename note),
-    plus an image or generic media block carrying the base64 file data.
+def _save_uploaded_file(thread_key: str, filename: str, raw: bytes) -> None:
+    """Save a user-sent file into this chat's workspace/uploads"""
+    directory = workspace.uploads_dir(thread_key)
+    base, ext = os.path.splitext(filename)
+    candidate = filename
+    i = 1
+    while os.path.exists(os.path.join(directory, candidate)):
+        candidate = f"{base}_{i}{ext}"
+        i += 1
+    with open(os.path.join(directory, candidate), "wb") as f:
+        f.write(raw)
 
-    Returns (blocks, error_message) - exactly one of the two is set. Images
-    use the image_url data-URI form; everything else (PDFs, text files,
-    audio, etc.) uses the generic media block, keyed by its mime type -
-    this is the multimodal content format langchain-google-genai expects.
-    """
+
+async def _download_as_content_blocks(
+    bot, file_id: str, mime_type: str, text_note: str | None, thread_key: str, filename: str
+):
+    """Download a Telegram file, save it into this chat's workspace, and turn it into LangChain multimodal content blocks"""
     try:
         tg_file = await bot.get_file(file_id)
     except Exception as exc:
@@ -371,7 +373,13 @@ async def _download_as_content_blocks(bot, file_id: str, mime_type: str, text_no
         logger.warning(f"Failed to download Telegram file {file_id}: {exc}")
         return None, "Sorry, I couldn't download that file from Telegram. Please try again."
 
-    encoded = base64.b64encode(bytes(raw)).decode("ascii")
+    raw_bytes = bytes(raw)
+    try:
+        await asyncio.to_thread(_save_uploaded_file, thread_key, filename, raw_bytes)
+    except Exception as exc:
+        logger.warning(f"Failed to save uploaded file for thread {thread_key}: {exc}")
+
+    encoded = base64.b64encode(raw_bytes).decode("ascii")
 
     blocks = []
     if text_note:
@@ -384,9 +392,7 @@ async def _download_as_content_blocks(bot, file_id: str, mime_type: str, text_no
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming photos: downloads the highest-resolution size and
-    hands it to the agent as an image (plus any caption), so the LLM can
-    actually see what was sent rather than just being told about it."""
+    """Handles incoming photos"""
     if not update.message.photo:
         return
 
@@ -395,8 +401,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     thread_key = build_thread_key(user_id, message_thread_id)
 
     photo = update.message.photo[-1]  # last entry = highest resolution
+    filename = f"photo_{photo.file_unique_id}.jpg"
     blocks, error = await _download_as_content_blocks(
-        context.bot, photo.file_id, "image/jpeg", update.message.caption
+        context.bot, photo.file_id, "image/jpeg", update.message.caption,
+        thread_key=thread_key, filename=filename,
     )
     if error:
         await update.message.reply_text(error)
@@ -427,7 +435,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text_note = update.message.caption or (
         f"[Attached file: {document.file_name}]" if document.file_name else None
     )
-    blocks, error = await _download_as_content_blocks(context.bot, document.file_id, mime_type, text_note)
+    filename = document.file_name or f"file_{document.file_unique_id}"
+    blocks, error = await _download_as_content_blocks(
+        context.bot, document.file_id, mime_type, text_note,
+        thread_key=thread_key, filename=filename,
+    )
     if error:
         await update.message.reply_text(error)
         return

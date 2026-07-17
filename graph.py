@@ -1,27 +1,95 @@
 """Agent graph definition.
 Nodes:
-    start_turn -> planner -> agent <-> tools -> finish_step
+    start_turn -> compact_history -> planner -> agent <-> tools -> finish_step
         -> [replan -> agent <-> tools -> finish_step]* -> END
 
 `messages` is the durable, full conversation (persisted across turns by
-the checkpointer, same as before). `plan` / `past_steps` / `current_task`
-/ `step_messages` are scratch state for the turn currently in progress,
-reset by `start_turn` every time a new user message comes in.
+the checkpointer). `plan` / `past_steps` / `current_task` / `step_messages`
+are scratch state for the turn currently in progress, reset by
+`start_turn` every time a new user message comes in.
+
+`conversation_summary` is durable too (not reset by start_turn):
+`compact_history` keeps `messages` bounded to a recent, dynamically-sized
+window and folds anything older into this summary, so a long-running
+conversation doesn't grow the checkpoint - or the planner's input - without
+bound.
+
+Every LLM call in this graph (planner, replanner, and the tool-executing
+agent) is additionally primed with: the operator's global instructions
+file (applies to every chat), this chat's own persistent notes file (the
+agent maintains it via the remember_about_chat tool), and the rolling
+conversation_summary above - see `_context_blocks`.
 """
 from typing import Annotated, List, Literal, Tuple, TypedDict
 
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, trim_messages
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import BaseModel, Field
 
-from llm import build_llm, build_raw_llm, extract_planner_text
+from llm import build_llm, build_raw_llm, extract_planner_text, extract_text
 from tools import TOOLS
+import workspace as ws
 
 
 GOOGLE_SEARCH_TOOL = {"google_search": {}}
+
+# Recent messages are kept verbatim in `messages` up to this approximate
+# token budget (a dynamically-sized window: a run of short messages fits
+# more of them, a couple of huge ones may be all that fits). Anything
+# older gets folded into `conversation_summary` and dropped - see
+# `compact_history`.
+HISTORY_TOKEN_BUDGET = 3000
+
+SUMMARIZER_SYSTEM_PROMPT = """You maintain a running summary of an ongoing \
+conversation between a user and an AI assistant, so that older turns can \
+be dropped from the assistant's context without losing the thread. Given \
+the existing summary (if any) and a batch of older messages that are \
+about to be dropped, write an updated summary that folds the new \
+messages into it. Keep it compact - a few sentences to a short paragraph \
+- and focus on facts, decisions, preferences, and unresolved threads the \
+assistant will need to stay consistent later. Output only the summary \
+text itself, with no preamble."""
+
+
+def _thread_key_from_config(config: RunnableConfig) -> str:
+    return config["configurable"]["thread_id"]
+
+
+def _context_blocks(thread_key: str, conversation_summary: str | None) -> list[tuple[str, str]]:
+    """(role, text) system blocks shared by every LLM call in this graph:
+    the operator's global instructions (all chats), this chat's own
+    persistent notes (the agent maintains these via remember_about_chat),
+    and the rolling conversation summary. Read fresh every call - global
+    instructions and notes can change mid-conversation (an operator
+    editing the file, or the agent calling remember_about_chat)."""
+    blocks = []
+
+    global_instructions = ws.load_global_instructions()
+    if global_instructions:
+        blocks.append((
+            "system",
+            f"Operator-configured instructions that apply to every chat:\n{global_instructions}",
+        ))
+
+    notes = ws.load_chat_notes(thread_key)
+    if notes:
+        blocks.append((
+            "system",
+            f"Notes you previously saved about this chat/user (see remember_about_chat):\n{notes}",
+        ))
+
+    if conversation_summary:
+        blocks.append((
+            "system",
+            f"Summary of earlier parts of this conversation (older messages "
+            f"have already been compacted out of context):\n{conversation_summary}",
+        ))
+
+    return blocks
 
 
 class AgentState(TypedDict):
@@ -40,6 +108,13 @@ class AgentState(TypedDict):
     # add_messages reducer so ToolNode can just append ToolMessages;
     # it's reset between steps with RemoveMessage (see _replace_step_messages).
     step_messages: Annotated[list, add_messages]
+
+    # --- Durable, cross-turn state (NOT reset by start_turn). ---
+    # A running summary of whatever has been dropped out of `messages`
+    # by compact_history, so context from far back in a long conversation
+    # isn't simply lost. Plain str - overwritten wholesale each time it's
+    # updated, no reducer needed.
+    conversation_summary: str
 
 
 class Plan(BaseModel):
@@ -92,7 +167,7 @@ repeat a step whose result already appears below."""
 def _step_task_message(plan: List[str], latest_human_message: HumanMessage) -> HumanMessage:
     """Build the scoped instruction for executing plan[0] - and only plan[0]."""
     plan_str = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(plan))
-    
+
     instruction = (
         f"\n\nFull plan (for context only, do not act on the other steps):\n{plan_str}\n\n"
         f"Execute ONLY this step now:\n1. {plan[0]}\n\n"
@@ -137,9 +212,53 @@ def get_graph_definition() -> StateGraph:
             "step_messages": [RemoveMessage(id=m.id) for m in state.get("step_messages", [])],
         }
 
-    async def plan_step(state: AgentState) -> AgentState:
+    async def compact_history(state: AgentState) -> AgentState:
+        """Keeps `messages` bounded going forward. Recent messages are kept
+        verbatim up to HISTORY_TOKEN_BUDGET (a dynamic window - lots of
+        short messages fit, only one or two huge ones might), and anything
+        older than that is folded into `conversation_summary` via a single
+        extra LLM call and then permanently dropped with RemoveMessage, so
+        neither the checkpointed history nor the planner's input to the
+        model grows without bound over a long-running conversation.
+        """
+        messages = state["messages"]
+        kept = trim_messages(
+            messages,
+            max_tokens=HISTORY_TOKEN_BUDGET,
+            token_counter="approximate",
+            strategy="last",
+            start_on="human",
+            include_system=False,
+        )
+        kept_ids = {m.id for m in kept}
+        dropped = [m for m in messages if m.id not in kept_ids]
+
+        if not dropped:
+            return {}
+
+        dropped_text = "\n".join(
+            f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {extract_planner_text(m.content)}"
+            for m in dropped
+        )
+        prior_summary = state.get("conversation_summary") or "(none yet)"
+        prompt = (
+            f"Existing summary:\n{prior_summary}\n\n"
+            f"Older messages to fold in:\n{dropped_text}"
+        )
+        summarizer = build_raw_llm(temperature=0)
+        result = await summarizer.ainvoke([("system", SUMMARIZER_SYSTEM_PROMPT), ("user", prompt)])
+        new_summary = extract_text(result.content).strip()
+
+        return {
+            "conversation_summary": new_summary or prior_summary,
+            "messages": [RemoveMessage(id=m.id) for m in dropped],
+        }
+
+    async def plan_step(state: AgentState, config: RunnableConfig) -> AgentState:
         # Prepare the messages for the planner
-        planner_messages = [("system", PLANNER_SYSTEM_PROMPT)]
+        thread_key = _thread_key_from_config(config)
+        summary = state.get("conversation_summary")
+        planner_messages = [("system", PLANNER_SYSTEM_PROMPT), *_context_blocks(thread_key, summary)]
         for m in state["messages"]:
             if isinstance(m, HumanMessage):
                 planner_messages.append(("human", extract_planner_text(m.content)))
@@ -157,8 +276,10 @@ def get_graph_definition() -> StateGraph:
             "step_messages": _replace_step_messages(state["step_messages"], _step_task_message(steps, latest_human)),
         }
 
-    async def agent_node(state: AgentState) -> AgentState:
-        response = await llm_with_tools.ainvoke(state["step_messages"])
+    async def agent_node(state: AgentState, config: RunnableConfig) -> AgentState:
+        thread_key = _thread_key_from_config(config)
+        context = _context_blocks(thread_key, state.get("conversation_summary"))
+        response = await llm_with_tools.ainvoke([*context, *state["step_messages"]])
         return {"step_messages": [response]}
 
     def route_after_agent(state: AgentState) -> Literal["tools", "finish_step"]:
@@ -185,15 +306,19 @@ def get_graph_definition() -> StateGraph:
             return END
         return "replan"
 
-    async def replan_step(state: AgentState) -> AgentState:
+    async def replan_step(state: AgentState, config: RunnableConfig) -> AgentState:
         past_steps_str = "\n\n".join(
             f"Step: {task}\nResult: {result}" for task, result in state["past_steps"]
         )
         latest_human = next(m for m in reversed(state["messages"]) if isinstance(m, HumanMessage))
         original_request = extract_planner_text(latest_human.content)
+        thread_key = _thread_key_from_config(config)
+        summary = state.get("conversation_summary")
 
+        context_text = "\n\n".join(text for _, text in _context_blocks(thread_key, summary))
         prompt = (
-            f"Original request:\n{original_request}\n\n"
+            (f"{context_text}\n\n" if context_text else "")
+            + f"Original request:\n{original_request}\n\n"
             f"Original plan:\n" + "\n".join(f"- {s}" for s in state["plan"]) + "\n\n"
             f"Steps executed so far:\n{past_steps_str}"
         )
@@ -215,6 +340,7 @@ def get_graph_definition() -> StateGraph:
 
     graph = StateGraph(AgentState)
     graph.add_node("start_turn", start_turn)
+    graph.add_node("compact_history", compact_history)
     graph.add_node("planner", plan_step)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", ToolNode(TOOLS, messages_key="step_messages"))
@@ -222,7 +348,8 @@ def get_graph_definition() -> StateGraph:
     graph.add_node("replan", replan_step)
 
     graph.add_edge(START, "start_turn")
-    graph.add_edge("start_turn", "planner")
+    graph.add_edge("start_turn", "compact_history")
+    graph.add_edge("compact_history", "planner")
     graph.add_edge("planner", "agent")
     graph.add_conditional_edges("agent", route_after_agent, {"tools": "tools", "finish_step": "finish_step"})
     graph.add_edge("tools", "agent")
