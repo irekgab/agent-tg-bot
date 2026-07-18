@@ -1,14 +1,3 @@
-"""Tool definitions available to the agent.
-
-Add new tools here as plain functions decorated with @tool, then add
-them to the TOOLS list. Keep each tool small and single-purpose.
-
-File tools (read_file/write_file/list_directory/remember_about_chat)
-operate inside the *current chat's own workspace* - see workspace.py -
-resolved via the current_chat_context contextvar below, the same
-mechanism schedule_message uses to find its way back to the right chat.
-"""
-import re
 import os
 import subprocess
 import contextvars
@@ -18,58 +7,16 @@ from langchain_core.tools import tool
 
 import workspace as ws
 
-GOOGLE_SEARCH_TOOL = {"google_search": {}}
-
-@tool
-def get_current_time() -> str:
-    """Return the current UTC date and time as an ISO-8601 string."""
-    return datetime.now(timezone.utc).isoformat()
-
-
-# ---------------------------------------------------------------------------
-# Proactive / scheduled messaging support.
-#
-# `schedule_message` lets the agent arrange to "speak first" later, e.g. when
-# a user asks to be reminded or followed up with after some delay. The tool
-# itself has no idea it's running inside a Telegram bot - it just reads the
-# current chat context from a contextvar (set by the caller, e.g.
-# telegram_bot.py, right before invoking the graph) and delegates the actual
-# scheduling to a callback that the host application registers at startup.
-# This keeps tools.py free of any Telegram-specific imports.
-# ---------------------------------------------------------------------------
-
-# Set by the host app (e.g. telegram_bot.py) via ContextVar.set() right
-# before invoking the graph, so tools running mid-turn know which chat/
-# thread to schedule a follow-up for. LangChain's executor-based tool
-# invocation (`run_in_executor`) copies the current context into the worker
-# thread, so this propagates correctly even though tools run synchronously.
 current_chat_context: contextvars.ContextVar = contextvars.ContextVar(
     "current_chat_context", default=None
 )
 
-# Set by the host app at startup: a callable with signature
-# (chat_id, message_thread_id, thread_key, delay_seconds, instruction) -> None
-# that arranges for the agent to be invoked again after delay_seconds with
-# the given instruction as context, and for the result to be sent back to
-# the same chat/thread.
 SCHEDULE_CALLBACK = None
-
-# Set by the host app at startup: a callable with signature
-# (chat_id, message_thread_id, thread_key, path, caption) -> (success, error)
-# that actually sends the file to the user (e.g. via the Telegram Bot API)
-# and reports back whether it worked. Unlike SCHEDULE_CALLBACK this one is
-# awaited for its result, since the agent needs to know whether the send
-# actually succeeded.
 SEND_FILE_CALLBACK = None
-
-MAX_SEND_FILE_BYTES = 50 * 1024 * 1024  # Telegram Bot API's own upload limit
+MAX_SEND_FILE_BYTES = 50 * 1024 * 1024
 
 
 def _current_thread_key() -> str:
-    """The thread_key for whichever chat this tool call is running inside,
-    from the same contextvar schedule_message uses. Falls back to a fixed
-    key when there's no chat context (e.g. running tools outside the bot),
-    keeping that case fully separate from any real chat's files."""
     ctx = current_chat_context.get()
     if ctx is None:
         return "_default"
@@ -77,7 +24,6 @@ def _current_thread_key() -> str:
 
 
 def _resolve_safe_path(path: str) -> str:
-    """Resolve a path and ensure it stays inside this chat's own workspace."""
     base = os.path.abspath(ws.workspace_dir(_current_thread_key()))
     full_path = os.path.abspath(os.path.join(base, path))
     if not (full_path == base or full_path.startswith(base + os.path.sep)):
@@ -86,8 +32,14 @@ def _resolve_safe_path(path: str) -> str:
 
 
 @tool
+def get_current_time() -> str:
+    """Returns the current UTC time in ISO format."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+@tool
 def read_file(path: str) -> str:
-    """Read and return the text contents of a file inside the workspace."""
+    """Reads the content of a file from the workspace."""
     try:
         full_path = _resolve_safe_path(path)
         with open(full_path, "r", encoding="utf-8") as f:
@@ -98,7 +50,7 @@ def read_file(path: str) -> str:
 
 @tool
 def write_file(path: str, content: str) -> str:
-    """Write text content to a file inside the workspace, creating it if needed."""
+    """Writes content to a file in the workspace."""
     try:
         full_path = _resolve_safe_path(path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
@@ -111,7 +63,7 @@ def write_file(path: str, content: str) -> str:
 
 @tool
 def list_directory(path: str = ".") -> str:
-    """List files and subdirectories at a given path inside the workspace."""
+    """Lists the files and directories in a given path."""
     try:
         full_path = _resolve_safe_path(path)
         entries = os.listdir(full_path)
@@ -124,7 +76,7 @@ def list_directory(path: str = ".") -> str:
 
 @tool
 def execute_command(command: str) -> str:
-    """Execute a shell command inside the workspace and return its stdout and stderr."""
+    """Executes a shell command in the workspace."""
     try:
         result = subprocess.run(
             command,
@@ -150,7 +102,7 @@ def execute_command(command: str) -> str:
 
 @tool
 def make_web_request(url: str, method: str = "GET", headers: dict = None, data: str = None, params: dict = None) -> str:
-    """Make an HTTP request to a specified URL."""
+    """Performs a HTTP request."""
     import requests
     try:
         response = requests.request(
@@ -168,7 +120,7 @@ def make_web_request(url: str, method: str = "GET", headers: dict = None, data: 
 
 @tool
 def schedule_message(delay_seconds: int, instruction: str) -> str:
-    """Schedule a follow-up message to be sent to this same chat later, without waiting for the user to write again."""
+    """Schedules a follow-up message."""
     if delay_seconds is None or delay_seconds <= 0:
         return "Error: delay_seconds must be a positive number of seconds."
 
@@ -192,12 +144,7 @@ def schedule_message(delay_seconds: int, instruction: str) -> str:
 
 @tool
 def remember_about_chat(content: str) -> str:
-    """Overwrite this chat's persistent notes (a Markdown file) with the
-    given content. Use this to save durable context about this user or
-    conversation - preferences, ongoing projects, names, prior decisions -
-    that should stay available even after old messages get summarized
-    away or the chat history is cleared. This REPLACES whatever was saved
-    before, so include everything still worth keeping, not just what's new."""
+    """Saves notes about the current chat."""
     try:
         ws.write_chat_notes(_current_thread_key(), content)
         return "Chat notes updated."
@@ -207,11 +154,7 @@ def remember_about_chat(content: str) -> str:
 
 @tool
 def send_file_to_user(path: str, caption: str = "") -> str:
-    """Send a file from this chat's workspace to the user, e.g. a document,
-    PDF, spreadsheet, or image you generated with write_file, or one the
-    user uploaded earlier. `path` must be a file already inside this
-    chat's workspace. Images (.jpg/.jpeg/.png/.gif/.webp) are sent as
-    photos; everything else is sent as a document. `caption` is optional."""
+    """Sends a file from the workspace to the user."""
     ctx = current_chat_context.get()
     if ctx is None or SEND_FILE_CALLBACK is None:
         return "Error: sending files isn't available in this context."
@@ -242,6 +185,8 @@ def send_file_to_user(path: str, caption: str = "") -> str:
         return f"Error sending file: {error}"
     return f"Sent '{path}' to the user."
 
+
+GOOGLE_SEARCH_TOOL = {"google_search": {}}
 
 TOOLS = [
     get_current_time,

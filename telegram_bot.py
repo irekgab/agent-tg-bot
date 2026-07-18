@@ -25,28 +25,16 @@ MAIN_LOOP: asyncio.AbstractEventLoop = None
 
 SAFE_CHUNK = 4095
 UPDATE_INTERVAL = 1.0
-MESSAGE_COMBINE_DELAY = 1.0
-MAX_FILE_BYTES = 20 * 1024 * 1024 # Telegram Bot API's own upload limit
+MESSAGE_COMBINE_DELAY = 0.5
+MAX_FILE_BYTES = 20 * 1024 * 1024
 
-# Per-thread pending-message buffers, and the debounce task currently
-# waiting to flush each one. Guarded by _pending_guard purely for
-# safety/clarity - the section it protects never awaits, so it's already
-# atomic under asyncio's cooperative scheduling, but a lock costs nothing
-# here and keeps this robust if that ever changes.
 _pending_messages: dict[str, list[str]] = {}
 _pending_tasks: dict[str, asyncio.Task] = {}
 _pending_guard = asyncio.Lock()
 
-# Per-thread-key locks. concurrent_updates(True) (set on the Application
-# below) lets PTB dispatch updates for different chats/threads fully in
-# parallel instead of queuing behind whichever update happens to be
-# in-flight - but two overlapping turns for the *same* thread_key (e.g. a
-# live message arriving right as a scheduled follow-up fires) would then
-# race on the same LangGraph checkpointer row. These locks keep each
-# individual thread's turns sequential while leaving different threads
-# fully concurrent.
 _thread_locks: dict[str, asyncio.Lock] = {}
 _thread_locks_guard = asyncio.Lock()
+_active_turn_tasks: dict[str, asyncio.Task] = {}
 
 
 async def _get_thread_lock(thread_key: str) -> asyncio.Lock:
@@ -59,13 +47,6 @@ async def _get_thread_lock(thread_key: str) -> asyncio.Lock:
 
 
 def build_thread_key(user_id: int, message_thread_id: int | None) -> str:
-    """Per-user, per-topic conversation identity.
-
-    Using only the Telegram user_id (the old behaviour) means every forum
-    topic / thread the same user writes in shares one conversation history.
-    Folding the message_thread_id in gives each topic its own independent
-    history while still keeping different users fully separate.
-    """
     if message_thread_id:
         return f"{user_id}:{message_thread_id}"
     return str(user_id)
@@ -79,7 +60,6 @@ def get_message_thread_id(update: Update):
 
 
 def split_chunk(text: str, limit: int = SAFE_CHUNK):
-    """Split text into (chunk, remainder), preferring a newline boundary."""
     if len(text) <= limit:
         return text, ""
     split_at = text.rfind("\n", 0, limit)
@@ -89,8 +69,6 @@ def split_chunk(text: str, limit: int = SAFE_CHUNK):
 
 
 async def safe_edit(message, raw_text: str, with_cursor: bool = False):
-    """Edit a message, transparently handling Telegram rate limits (429s)
-    and falling back to plain text if Markdown entity parsing fails."""
     display = raw_text + (" ▌" if with_cursor else "")
     try:
         formatted = markdownify(display)
@@ -121,7 +99,6 @@ async def safe_edit(message, raw_text: str, with_cursor: bool = False):
 
 
 async def safe_send(bot, chat_id, raw_text: str, message_thread_id=None, with_cursor: bool = False):
-    """Send a new message with the same rate-limit/Markdown-fallback handling as safe_edit."""
     display = raw_text + (" ▌" if with_cursor else "")
     try:
         formatted = markdownify(display)
@@ -152,7 +129,6 @@ async def safe_send(bot, chat_id, raw_text: str, message_thread_id=None, with_cu
 
 
 async def safe_chat_action(bot, chat_id, action, message_thread_id=None):
-    """Perform a chat action, handling rate limits and timeouts."""
     for _ in range(5):
         try:
             return await bot.send_chat_action(
@@ -168,8 +144,28 @@ async def safe_chat_action(bot, chat_id, action, message_thread_id=None):
     return None
 
 
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    message_thread_id = get_message_thread_id(update)
+    thread_key = build_thread_key(user_id, message_thread_id)
+
+    async with _pending_guard:
+        pending_task = _pending_tasks.pop(thread_key, None)
+        had_pending_text = bool(_pending_messages.pop(thread_key, None))
+    if pending_task and not pending_task.done():
+        pending_task.cancel()
+
+    active_task = _active_turn_tasks.get(thread_key)
+    if active_task and not active_task.done():
+        active_task.cancel()
+        await update.message.reply_text("Okay, I won't respond to that.")
+    elif had_pending_text:
+        await update.message.reply_text("Okay, I won't respond to that.")
+    else:
+        await update.message.reply_text("Nothing is currently running.")
+
+
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clears the conversation history and this chat's whole workspace"""
     user_id = update.effective_user.id
     thread_key = build_thread_key(user_id, get_message_thread_id(update))
 
@@ -204,7 +200,6 @@ async def process_agent_turn(
     message_thread_id=None,
     status_message=None,
 ) -> None:
-    """Run one turn of the agent for (chat_id, thread_key) and stream the reply into Telegram """
     global app
     if app is None:
         logger.error("Agent graph is not initialized.")
@@ -212,7 +207,13 @@ async def process_agent_turn(
 
     lock = await _get_thread_lock(thread_key)
     async with lock:
-        await _run_agent_turn(bot, chat_id, thread_key, user_content, message_thread_id)
+        task = asyncio.current_task()
+        _active_turn_tasks[thread_key] = task
+        try:
+            await _run_agent_turn(bot, chat_id, thread_key, user_content, message_thread_id)
+        finally:
+            if _active_turn_tasks.get(thread_key) is task:
+                del _active_turn_tasks[thread_key]
 
 
 async def _run_agent_turn(
@@ -222,7 +223,6 @@ async def _run_agent_turn(
     user_content: str,
     message_thread_id=None,
 ) -> None:
-    """The actual turn logic, run while holding this thread_key's lock."""
     config = {"configurable": {"thread_id": thread_key}}
     token = tools.current_chat_context.set(
         {"chat_id": chat_id, "message_thread_id": message_thread_id, "thread_key": thread_key}
@@ -303,6 +303,14 @@ async def _run_agent_turn(
         tool_status = None
         await flush(final=True)
 
+    except asyncio.CancelledError:
+        tool_status = None
+        full_response = (full_response.rstrip() + "\n\n" if full_response else "") + "_⏹ Stopped._"
+        try:
+            await flush(final=True)
+        except Exception:
+            pass
+
     except Exception as e:
         logger.error(f"Error processing message for thread {thread_key}: {e}")
         await safe_send(bot, chat_id, "An error occurred while processing your request. Please try again later.", message_thread_id=message_thread_id)
@@ -311,7 +319,6 @@ async def _run_agent_turn(
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming text messages from Telegram users with streaming responses and Markdown support."""
     user_id = update.effective_user.id
     user_text = update.message.text
     if not user_text:
@@ -323,7 +330,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     bot = context.bot
 
     async with _pending_guard:
-        is_first_in_batch = thread_key not in _pending_messages
         _pending_messages.setdefault(thread_key, []).append(user_text)
 
         existing_task = _pending_tasks.get(thread_key)
@@ -335,7 +341,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _save_uploaded_file(thread_key: str, filename: str, raw: bytes) -> None:
-    """Save a user-sent file into this chat's workspace/uploads"""
     directory = workspace.uploads_dir(thread_key)
     base, ext = os.path.splitext(filename)
     candidate = filename
@@ -350,7 +355,6 @@ def _save_uploaded_file(thread_key: str, filename: str, raw: bytes) -> None:
 async def _download_as_content_blocks(
     bot, file_id: str, mime_type: str, text_note: str | None, thread_key: str, filename: str
 ):
-    """Download a Telegram file, save it into this chat's workspace, and turn it into LangChain multimodal content blocks"""
     try:
         tg_file = await bot.get_file(file_id)
     except Exception as exc:
@@ -386,7 +390,6 @@ async def _download_as_content_blocks(
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming photos"""
     if not update.message.photo:
         return
 
@@ -394,7 +397,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message_thread_id = get_message_thread_id(update)
     thread_key = build_thread_key(user_id, message_thread_id)
 
-    photo = update.message.photo[-1]  # last entry = highest resolution
+    photo = update.message.photo[-1]
     filename = f"photo_{photo.file_unique_id}.jpg"
     blocks, error = await _download_as_content_blocks(
         context.bot, photo.file_id, "image/jpeg", update.message.caption,
@@ -414,9 +417,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming documents/files: downloads the file and hands it to
-    the agent (as an image or generic media block, depending on mime type)
-    plus any caption, or a filename note if there's no caption."""
     document = update.message.document
     if document is None:
         return
@@ -448,13 +448,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def _flush_pending_after_delay(bot, chat_id, thread_key: str, message_thread_id) -> None:
-    """Waits MESSAGE_COMBINE_DELAY; if not superseded by a newer message in
-    the same thread arriving first (which cancels this task), combines and
-    processes everything buffered for this thread as one turn."""
     try:
         await asyncio.sleep(MESSAGE_COMBINE_DELAY)
     except asyncio.CancelledError:
-        return  # A newer message reset the timer; its own task will flush.
+        return 
 
     async with _pending_guard:
         texts = _pending_messages.pop(thread_key, [])
@@ -474,9 +471,6 @@ async def _flush_pending_after_delay(bot, chat_id, thread_key: str, message_thre
 
 
 def schedule_followup(chat_id, message_thread_id, thread_key, delay_seconds, instruction) -> None:
-    """Registered as tools.SCHEDULE_CALLBACK. Called synchronously from a
-    tool-execution worker thread, so it hands off to the bot's event loop
-    via call_soon_threadsafe rather than touching the JobQueue directly."""
     def _do_schedule():
         if application is None or application.job_queue is None:
             logger.error("Cannot schedule follow-up: job queue is not available.")
@@ -500,9 +494,6 @@ def schedule_followup(chat_id, message_thread_id, thread_key, delay_seconds, ins
 
 
 async def on_scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fires when a scheduled follow-up's delay has elapsed. Re-invokes the
-    agent (with the original instruction as context) and sends whatever it
-    produces to the user as a fresh, bot-initiated message."""
     data = context.job.data
     instruction_text = (
         "[Automated trigger: earlier in this conversation you scheduled a follow-up for "
@@ -522,9 +513,6 @@ IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
 
 
 async def _send_file(chat_id, message_thread_id, path: str, caption: str):
-    """Actually sends a document or photo to the user. Runs on the bot's
-    event loop (invoked via send_file_callback below). Returns
-    (success, error_message)."""
     filename = os.path.basename(path)
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     is_image = ext in IMAGE_EXTENSIONS
@@ -574,12 +562,6 @@ async def _send_file(chat_id, message_thread_id, path: str, caption: str):
 
 
 def send_file_callback(chat_id, message_thread_id, thread_key, path, caption):
-    """Registered as tools.SEND_FILE_CALLBACK. Called synchronously from a
-    tool-execution worker thread. Unlike schedule_followup this needs to
-    report success/failure back to the agent, so - rather than just firing
-    off a callback - it schedules the actual send on the bot's event loop
-    via run_coroutine_threadsafe and blocks this worker thread on the
-    result."""
     if application is None or MAIN_LOOP is None:
         return False, "Bot is not running."
     future = asyncio.run_coroutine_threadsafe(
@@ -592,7 +574,6 @@ def send_file_callback(chat_id, message_thread_id, thread_key, path, caption):
 
 
 async def main() -> None:
-    """Starts the Telegram bot."""
     global application, MAIN_LOOP
     configure_logging()
     MAIN_LOOP = asyncio.get_running_loop()
@@ -602,6 +583,7 @@ async def main() -> None:
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
     application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
