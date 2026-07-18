@@ -4,7 +4,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from llm import build_llm
+from llm import build_llm, LoggingCallbackHandler
 from tools import TOOLS, GOOGLE_SEARCH_TOOL
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -20,7 +20,10 @@ def get_graph_definition() -> StateGraph:
     )
 
     async def agent_node(state: AgentState) -> AgentState:
-        response = await llm_with_tools.ainvoke(state["messages"])
+        response = await llm_with_tools.ainvoke(
+            state["messages"],
+            config={"callbacks": [LoggingCallbackHandler()]}
+        )
         return {"messages": [response]}
 
     graph = StateGraph(AgentState)

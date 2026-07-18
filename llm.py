@@ -1,7 +1,26 @@
+import contextlib
+import os
 from typing import Any
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.callbacks import BaseCallbackHandler
 
 from config import LLM_API_KEY, MODEL_NAME
+import tools
+import workspace as ws
+
+
+class LoggingCallbackHandler(BaseCallbackHandler):
+    def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], **kwargs: Any) -> Any:
+        thread_key = tools._current_thread_key()
+        log_file = os.path.join(ws.workspace_dir(thread_key), "llm_log.txt")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n--- NEW TURN ---\nPrompt: {prompts[0]}\n")
+
+    def on_llm_end(self, response: Any, **kwargs: Any) -> Any:
+        thread_key = tools._current_thread_key()
+        log_file = os.path.join(ws.workspace_dir(thread_key), "llm_log.txt")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"Response: {response.generations[0][0].text}\n")
 
 
 def build_raw_llm(temperature: float = 0.7) -> ChatGoogleGenerativeAI:
