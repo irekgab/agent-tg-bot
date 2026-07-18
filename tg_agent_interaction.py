@@ -92,29 +92,36 @@ async def _run_agent_turn(
 
 
     try:
-        async for chunk, metadata in tg_bot_state.app.astream(
+        async for event in tg_bot_state.app.astream_events(
             {"messages": [{"role": "user", "content": user_content}]},
             config=config,
-            stream_mode="messages",
+            version="v2",
         ):
-            node = metadata.get("langgraph_node")
+            kind = event["event"]
+            node = event["metadata"].get("langgraph_node")
             
-            text = extract_text(chunk.content)
-            if node == "agent" and text:
-                if stage_boundary_pending and full_response:
-                    full_response += "\n\n\n"
-                stage_boundary_pending = False
-                full_response += text
-                tool_status = None
-                last_shown_tool_status = None
-                await flush()
-            else:
-                tool_status = "_⚙️ Thinking..._"
+            if kind == "on_chat_model_stream" and node == "agent":
+                chunk = event["data"]["chunk"]
+                text = extract_text(chunk.content)
+                if text:
+                    if stage_boundary_pending and full_response:
+                        full_response += "\n\n\n"
+                    stage_boundary_pending = False
+                    full_response += text
+                    tool_status = None
+                    last_shown_tool_status = None
+                    if time.monotonic() - last_update_time >= tg_bot_state.UPDATE_INTERVAL:
+                        await flush()
+            elif kind == "on_chain_start" and node == "tools":
+                tool_status = "_⚙️ Using tools..._"
                 stage_boundary_pending = True
                 if tool_status != last_shown_tool_status:
-                    await flush()
+                    if time.monotonic() - last_update_time >= tg_bot_state.UPDATE_INTERVAL:
+                        await flush()
                     last_shown_tool_status = tool_status
-
+            elif kind == "on_chain_end" and node == "tools":
+                tool_status = None
+        
         tool_status = None
         await flush(final=True)
 

@@ -33,11 +33,18 @@ def get_graph_definition() -> StateGraph:
             include_system=True,
             allow_partial=False,
         )
-        response = await llm_with_tools.ainvoke(
+        
+        full_response = None
+        async for chunk in llm_with_tools.astream(
             trimmed_messages,
             config={"callbacks": [LoggingCallbackHandler()]}
-        )
-        return {"messages": [response]}
+        ):
+            if full_response is None:
+                full_response = chunk
+            else:
+                full_response = full_response + chunk
+        
+        return {"messages": [full_response]}
 
     graph = StateGraph(AgentState)
     graph.add_node("agent", agent_node)
