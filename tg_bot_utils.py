@@ -36,6 +36,8 @@ def split_chunk(text: str, limit: int = tg_bot_state.SAFE_CHUNK):
 
 async def safe_edit(message, raw_text: str, with_cursor: bool = False):
     display = raw_text + (" ▌" if with_cursor else "")
+    if not display.strip():
+        return message
     try:
         formatted = markdownify(display)
     except Exception:

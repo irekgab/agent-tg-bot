@@ -112,14 +112,14 @@ async def _run_agent_turn(
                     last_shown_tool_status = None
                     if time.monotonic() - last_update_time >= tg_bot_state.UPDATE_INTERVAL:
                         await flush()
-            elif kind == "on_chain_start" and node == "tools":
-                tool_status = "_⚙️ Using tools..._"
+            elif kind == "on_chain_start":
+                tool_status = "_⚙️ Processing..._"
                 stage_boundary_pending = True
                 if tool_status != last_shown_tool_status:
                     if time.monotonic() - last_update_time >= tg_bot_state.UPDATE_INTERVAL:
                         await flush()
                     last_shown_tool_status = tool_status
-            elif kind == "on_chain_end" and node == "tools":
+            elif kind == "on_chain_end":
                 tool_status = None
         
         tool_status = None
@@ -135,6 +135,8 @@ async def _run_agent_turn(
 
     except Exception as e:
         logger.error(f"Error processing message for thread {thread_key}: {e}")
-        await safe_send(bot, chat_id, "An error occurred while processing your request. Please try again later.", message_thread_id=message_thread_id)
+        await safe_send(bot, chat_id, "An error occurred while processing your request. " \
+        "This is most likely because either your prompt became too large or the API is currently very busy. " \
+        "You can /clear the conversation or try again a bit later.", message_thread_id=message_thread_id)
     finally:
         tools.current_chat_context.reset(token)
