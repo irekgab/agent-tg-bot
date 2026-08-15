@@ -26,12 +26,32 @@ def get_message_thread_id(update: Update):
         return message.message_thread_id
     return None
 
-def split_chunk(text: str, limit: int = tg_bot_state.SAFE_CHUNK):
-    if len(text) <= limit:
+def _formatted_len(text: str) -> int:
+    if not text:
+        return 0
+    try:
+        return len(markdownify(text))
+    except Exception:
+        return len(text)
+
+def split_chunk(text: str, limit: int = None):
+    limit = tg_bot_state.SAFE_CHUNK if limit is None else limit
+    if _formatted_len(text) <= limit:
         return text, ""
-    split_at = text.rfind("\n", 0, limit)
+
+    split_at = text.rfind("\n", 0, min(limit, len(text)))
     if split_at == -1 or split_at < limit * 0.4:
-        split_at = limit
+        split_at = min(limit, len(text))
+
+    while split_at > 0 and _formatted_len(text[:split_at]) > limit:
+        prev_newline = text.rfind("\n", 0, split_at - 1)
+        if prev_newline != -1 and prev_newline > split_at * 0.4:
+            split_at = prev_newline
+        else:
+            split_at = int(split_at * 0.9)
+
+    if split_at <= 0:
+        split_at = 1
     return text[:split_at], text[split_at:]
 
 async def safe_edit(message, raw_text: str, with_cursor: bool = False):
@@ -56,9 +76,6 @@ async def safe_edit(message, raw_text: str, with_cursor: bool = False):
             text = str(e).lower()
             if "message is not modified" in text:
                 return message
-            if formatted is not None:
-                formatted = None
-                continue
             logger.warning(f"Failed to edit message: {e}")
             return message
         except TimedOut:

@@ -16,7 +16,8 @@ def _require_env(name: str, default: str | None = None) -> str:
 
 
 LLM_API_KEY: str = _require_env("LLM_API_KEY")
-MODEL_NAME: str = _require_env("MODEL_NAME")
+HEAVY_MODEL_NAME: str = _require_env("HEAVY_MODEL_NAME")
+LIGHT_MODEL_NAME: str = _require_env("LIGHT_MODEL_NAME")
 TELEGRAM_BOT_TOKEN: str = _require_env("TELEGRAM_BOT_TOKEN")
 AGENT_WORKSPACE: str = _require_env("AGENT_WORKSPACE")
-MAX_HISTORY_TOKENS: int = int(os.getenv("MAX_HISTORY_TOKENS"))
+MAX_HISTORY_TOKENS: int = int(_require_env("MAX_HISTORY_TOKENS"))

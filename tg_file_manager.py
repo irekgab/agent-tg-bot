@@ -13,7 +13,7 @@ from tg_agent_interaction import process_agent_turn
 
 logger = logging.getLogger(__name__)
 
-def _save_uploaded_file(thread_key: str, filename: str, raw: bytes) -> None:
+def _save_uploaded_file(thread_key: str, filename: str, raw: bytes) -> str:
     directory = workspace.uploads_dir(thread_key)
     base, ext = os.path.splitext(filename)
     candidate = filename
@@ -23,6 +23,27 @@ def _save_uploaded_file(thread_key: str, filename: str, raw: bytes) -> None:
         i += 1
     with open(os.path.join(directory, candidate), "wb") as f:
         f.write(raw)
+    return candidate
+
+
+_LLM_SUPPORTED_MIME_PREFIXES = ("image/", "audio/", "video/")
+_LLM_SUPPORTED_MIME_EXACT = {
+    "application/pdf",
+    "text/plain",
+    "text/html",
+    "text/css",
+    "text/csv",
+    "text/xml",
+    "text/rtf",
+    "text/markdown",
+    "application/json",
+    "application/javascript",
+    "application/x-python-code",
+}
+
+
+def _llm_accepts_mime(mime_type: str) -> bool:
+    return mime_type in _LLM_SUPPORTED_MIME_EXACT or mime_type.startswith(_LLM_SUPPORTED_MIME_PREFIXES)
 
 
 async def _download_as_content_blocks(
@@ -45,20 +66,34 @@ async def _download_as_content_blocks(
         return None, "Sorry, I couldn't download that file from Telegram. Please try again."
 
     raw_bytes = bytes(raw)
+    saved_name = filename
     try:
-        await asyncio.to_thread(_save_uploaded_file, thread_key, filename, raw_bytes)
+        saved_name = await asyncio.to_thread(_save_uploaded_file, thread_key, filename, raw_bytes)
     except Exception as exc:
         logger.warning(f"Failed to save uploaded file for thread {thread_key}: {exc}")
 
-    encoded = base64.b64encode(raw_bytes).decode("ascii")
-
     blocks = []
-    if text_note:
-        blocks.append({"type": "text", "text": text_note})
     if mime_type.startswith("image/"):
+        encoded = base64.b64encode(raw_bytes).decode("ascii")
+        if text_note:
+            blocks.append({"type": "text", "text": text_note})
         blocks.append({"type": "image_url", "image_url": f"data:{mime_type};base64,{encoded}"})
-    else:
+    elif _llm_accepts_mime(mime_type):
+        encoded = base64.b64encode(raw_bytes).decode("ascii")
+        if text_note:
+            blocks.append({"type": "text", "text": text_note})
         blocks.append({"type": "media", "mime_type": mime_type, "data": encoded})
+    else:
+        note = text_note or f"[Attached file: {filename}]"
+        blocks.append({
+            "type": "text",
+            "text": (
+                f"{note}\n\n(This file's type ('{mime_type}') can't be sent directly "
+                f"to the model. It was saved to the workspace at "
+                f"uploads/{saved_name} - use the read_file or execute_command tools "
+                "to inspect or process it.)"
+            ),
+        })
     return blocks, None
 
 

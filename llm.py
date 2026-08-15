@@ -1,10 +1,9 @@
-import contextlib
 import os
 from typing import Any
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.callbacks import BaseCallbackHandler
 
-from config import LLM_API_KEY, MODEL_NAME
+from config import LLM_API_KEY, HEAVY_MODEL_NAME
 import tools
 import workspace as ws
 
@@ -23,17 +22,13 @@ class LoggingCallbackHandler(BaseCallbackHandler):
             f.write(f"Response: {response.generations[0][0].text}\n")
 
 
-def build_raw_llm(temperature: float = 0.7) -> ChatGoogleGenerativeAI:
+def build_llm(temperature: float = 0.2, model_name: str | None = None) -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
-        model=MODEL_NAME,
+        model=model_name or HEAVY_MODEL_NAME,
         google_api_key=LLM_API_KEY,
         temperature=temperature,
-        max_retries=7
+        max_retries=7,
     )
-
-
-def build_llm(temperature: float = 0.7) -> Any:
-    return build_raw_llm(temperature=temperature)
 
 
 def extract_text(content) -> str:

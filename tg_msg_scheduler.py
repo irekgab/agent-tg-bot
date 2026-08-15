@@ -36,5 +36,5 @@ async def on_scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=data["chat_id"],
         thread_key=data["thread_key"],
         user_content=data["instruction"],
-        message_thread_id=data.get("message_thread_id"),
+        message_thread_id=data["message_thread_id"],
     )

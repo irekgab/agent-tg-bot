@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import mimetypes
 from telegram import Update, constants
 from telegram.ext import ContextTypes
 from telegramify_markdown import markdownify
@@ -123,7 +124,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text_note = update.message.caption or (
         f"[Attached file: {document.file_name}]" if document.file_name else None
     )
+    guessed_mime = mimetypes.guess_type(document.file_name or "")[0]
     await _handle_file_upload(
-        update, context, document.file_id, document.mime_type or "application/octet-stream",
+        update, context, document.file_id, document.mime_type or guessed_mime or "application/octet-stream",
         document.file_name or f"file_{document.file_unique_id}", text_note
     )

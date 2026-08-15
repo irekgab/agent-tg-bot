@@ -71,7 +71,7 @@ def list_directory(path: str = ".") -> str:
             return "(empty directory)"
         return "\n".join(sorted(entries))
     except Exception as exc:
-        return f"Error: {exc}"    
+        return f"Error: {exc}"
 
 
 @tool

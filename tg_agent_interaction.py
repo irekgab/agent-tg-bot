@@ -14,7 +14,6 @@ async def process_agent_turn(
     thread_key: str,
     user_content: str,
     message_thread_id=None,
-    status_message=None,
 ) -> None:
     if tg_bot_state.app is None:
         logger.error("Agent graph is not initialized.")
@@ -64,27 +63,29 @@ async def _run_agent_turn(
     async def flush(final: bool = False) -> None:
         nonlocal current_message, flushed_len, last_update_time, tool_status
         pending = full_response[flushed_len:]
+        suffix = tool_status if (tool_status and not final) else ""
 
-        while len(pending) > tg_bot_state.SAFE_CHUNK:
-            chunk, pending = split_chunk(pending)
+        while True:
+            candidate_body = (pending + "\n\n" + suffix) if (pending and suffix) else (pending or suffix)
+            from tg_bot_utils import _formatted_len
+            if _formatted_len(candidate_body) <= tg_bot_state.SAFE_CHUNK:
+                break
+            reserve = _formatted_len("\n\n" + suffix) if (pending and suffix) else 0
+            chunk, pending = split_chunk(pending, limit=max(1, tg_bot_state.SAFE_CHUNK - reserve))
 
             if current_message is None:
                 current_message = await safe_send(bot, chat_id, chunk, message_thread_id=message_thread_id)
             else:
                 await wait_interval()
                 await safe_edit(current_message, chunk)
-
             flushed_len += len(chunk)
             current_message = None
-        
-        body = pending
-        if tool_status and not final:
-            body = (body + "\n\n" if body else "") + tool_status
 
+        body = candidate_body
         with_cursor = (not final and not tool_status and flushed_len + len(pending) == len(full_response))
 
         if current_message is None:
-            if body is not None:
+            if body:
                 current_message = await safe_send(bot, chat_id, body, message_thread_id=message_thread_id, with_cursor=with_cursor)
         else:
             await wait_interval()
@@ -100,7 +101,7 @@ async def _run_agent_turn(
             kind = event["event"]
             node = event["metadata"].get("langgraph_node")
             
-            if kind == "on_chat_model_stream" and node == "agent":
+            if kind == "on_chat_model_stream" and node == "executor":
                 chunk = event["data"]["chunk"]
                 text = extract_text(chunk.content)
                 if text:
@@ -113,11 +114,11 @@ async def _run_agent_turn(
                     if time.monotonic() - last_update_time >= tg_bot_state.UPDATE_INTERVAL:
                         await flush()
             elif kind == "on_chain_start":
-                tool_status = "_⚙️ Processing..._"
                 stage_boundary_pending = True
-                if tool_status != last_shown_tool_status:
-                    if time.monotonic() - last_update_time >= tg_bot_state.UPDATE_INTERVAL:
-                        await flush()
+                new_status = "_⚙️ Processing..._"
+                if new_status != last_shown_tool_status:
+                    tool_status = new_status
+                    await flush()
                     last_shown_tool_status = tool_status
             elif kind == "on_chain_end":
                 tool_status = None
